@@ -148,11 +148,18 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // decode independently. Both stages retain only the most recent frame.
     let mut mouse = MouseTracker::default();
     let mut notice = None;
+    let mut displayed_dimensions = None;
     let result = (|| -> Result<()> {
         while window.is_open() && !window.is_key_down(Key::Escape) {
             let current = receiver.borrow().clone();
             match current {
                 Ok(frame) => {
+                    let dimensions = (frame.width, frame.height);
+                    if displayed_dimensions != Some(dimensions) {
+                        window.set_title(&format!("{title} — {}×{}", frame.width, frame.height));
+                        println!("收到共享画面：{}×{} 像素。", frame.width, frame.height);
+                        displayed_dimensions = Some(dimensions);
+                    }
                     window.update_with_buffer(&frame.pixels, frame.width, frame.height)?;
                     if let Some(input) = &input {
                         match input.status() {
@@ -160,13 +167,19 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             Status::Notice(error) => {
                                 if notice.as_ref() != Some(&error) {
                                     eprintln!("{error}");
-                                    window.set_title(&format!("{title} — {error}"));
+                                    window.set_title(&format!(
+                                        "{title} — {}×{} — {error}",
+                                        frame.width, frame.height
+                                    ));
                                     notice = Some(error);
                                 }
                             }
                             Status::Ready => {
                                 if notice.take().is_some() {
-                                    window.set_title(&title);
+                                    window.set_title(&format!(
+                                        "{title} — {}×{}",
+                                        frame.width, frame.height
+                                    ));
                                 }
                             }
                         }

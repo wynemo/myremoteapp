@@ -231,6 +231,9 @@ async fn main() -> Result<()> {
                                 }
                             } else if matches!(&*current.source.frames.borrow(),Some(remote_session::CaptureEvent::Frame(_))) {
                                 ready.store(true,Ordering::Release);
+                                // A failed metadata refresh leaves the existing
+                                // stream running; lock/stop recovery remains above.
+                                let _=current.refresh_resolution();
                             }
                         }
                         #[cfg(not(target_os = "macos"))]

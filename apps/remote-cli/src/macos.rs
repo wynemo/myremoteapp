@@ -5,7 +5,7 @@ use screencapturekit::{
     cm::{CMSampleBufferSCExt, SCFrameStatus},
     cv::CVPixelBufferLockFlags,
     prelude::*,
-    stream::delegate_trait::StreamCallbacks,
+    stream::{configuration::SCCaptureResolutionType, delegate_trait::StreamCallbacks},
 };
 use std::{
     io::{self, IsTerminal, Write},
@@ -135,6 +135,8 @@ pub fn list_windows() -> Result<()> {
 
 pub struct CaptureSession {
     stream: SCStream,
+    configuration: SCStreamConfiguration,
+    dimensions: Mutex<(u32, u32)>,
     pub source: PreviewSource,
     input: Option<Arc<super::input_macos::MacInput>>,
     paused: Arc<AtomicBool>,
@@ -142,6 +144,35 @@ pub struct CaptureSession {
 }
 
 impl CaptureSession {
+    pub fn refresh_resolution(&self) -> Result<()> {
+        // Refresh filter metadata so resizing the app or moving it between
+        // displays updates the stream, without replacing the connected source.
+        let content = SCShareableContent::get()?;
+        let windows = content.windows();
+        let window = windows
+            .iter()
+            .find(|w| w.window_id() == self.source.window.id)
+            .context("共享窗口已关闭")?;
+        let filter = SCContentFilter::create().with_window(window).build()?;
+        let rect = filter.content_rect();
+        let dimensions = capture_dimensions(
+            rect.size.width,
+            rect.size.height,
+            f64::from(filter.point_pixel_scale()),
+        );
+        let mut current = self.dimensions.lock().unwrap();
+        if *current != dimensions {
+            let configuration = self
+                .configuration
+                .clone()
+                .with_width(dimensions.0)
+                .with_height(dimensions.1);
+            self.stream.update_configuration(&configuration)?;
+            *current = dimensions;
+            println!("共享分辨率已更新：{}×{}。", dimensions.0, dimensions.1);
+        }
+        Ok(())
+    }
     pub fn paused_for_lock(&self) -> bool {
         self.paused.load(Ordering::Acquire)
     }
@@ -221,6 +252,7 @@ pub fn start(window_id: Option<u32>, view_only: bool) -> Result<CaptureSession> 
     );
     println!("共享画面：{width}×{height}，10 FPS，高清文字模式。");
     let configuration = SCStreamConfiguration::new()
+        .with_capture_resolution_type(SCCaptureResolutionType::Best)?
         .with_width(width)
         .with_height(height)
         .with_pixel_format(PixelFormat::BGRA)
@@ -265,6 +297,8 @@ pub fn start(window_id: Option<u32>, view_only: bool) -> Result<CaptureSession> 
     );
     Ok(CaptureSession {
         stream,
+        configuration,
+        dimensions: Mutex::new((width, height)),
         input: input.clone(),
         paused,
         sender,
@@ -389,7 +423,12 @@ impl Handler {
             );
         }
         if sequence == 0 {
-            println!("已取得首帧，Windows 可以连接观看。");
+            println!("已取得首帧：{width}×{height}，Windows 可以连接观看。");
+            if width < 720 && height < 720 {
+                println!(
+                    "源窗口像素较少；请放大 Mac 上的目标窗口以改善小字清晰度，采集分辨率会自动跟随。"
+                );
+            }
         }
         Ok(PreviewFrame {
             width: width as u32,
