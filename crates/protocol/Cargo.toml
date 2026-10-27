@@ -8,3 +8,4 @@ publish.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+zeroize.workspace = true

@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, ErrorKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
+pub const MAX_PASSWORD_BYTES: usize = 4096;
 pub const MAX_CONTROL_BYTES: usize = 64 * 1024;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_FRAME_WIDTH: u32 = 1920;
@@ -55,19 +56,88 @@ pub struct MouseEvent {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Message {
-    Hello { version: u16 },
-    Welcome { version: u16 },
-    Ping { sequence: u64 },
-    Pong { sequence: u64 },
-    Error { code: ErrorCode },
+    Hello {
+        version: u16,
+    },
+    Welcome {
+        version: u16,
+    },
+    Ping {
+        sequence: u64,
+    },
+    Pong {
+        sequence: u64,
+    },
+    Error {
+        code: ErrorCode,
+    },
     Goodbye,
     StartPreview,
-    PreviewStarted { window: WindowInfo },
-    StartControl { window_id: u32 },
+    PreviewStarted {
+        window: WindowInfo,
+    },
+    StartControl {
+        window_id: u32,
+    },
     ControlReady,
-    Mouse { event: MouseEvent },
+    Mouse {
+        event: MouseEvent,
+    },
     ReleaseInput,
-    InputError { message: String },
+    InputError {
+        message: String,
+    },
+    GetStatus,
+    Status {
+        locked: bool,
+        unlock_available: bool,
+    },
+    /// The password follows as a separate bounded binary record, never JSON.
+    Unlock,
+    UnlockResult {
+        outcome: UnlockOutcome,
+    },
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnlockOutcome {
+    Unlocked,
+    Rejected,
+    Unavailable,
+    Busy,
+    WindowUnavailable,
+}
+
+pub async fn write_secret<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    password: &[u8],
+) -> io::Result<()> {
+    if password.is_empty()
+        || password.len() > MAX_PASSWORD_BYTES
+        || password.contains(&0)
+        || std::str::from_utf8(password).is_err()
+    {
+        return Err(invalid_data("invalid password record"));
+    }
+    writer.write_u32(password.len() as u32).await?;
+    writer.write_all(password).await?;
+    writer.flush().await
+}
+
+pub async fn read_secret<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> io::Result<zeroize::Zeroizing<Vec<u8>>> {
+    let length = reader.read_u32().await? as usize;
+    if length == 0 || length > MAX_PASSWORD_BYTES {
+        return Err(invalid_data("invalid password record"));
+    }
+    let mut bytes = zeroize::Zeroizing::new(vec![0; length]);
+    reader.read_exact(&mut bytes).await?;
+    if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
+        return Err(invalid_data("invalid password record"));
+    }
+    Ok(bytes)
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -269,5 +339,23 @@ mod tests {
                 .kind(),
             ErrorKind::InvalidData
         );
+    }
+
+    #[tokio::test]
+    async fn secret_record_round_trip_and_invalid_lengths() {
+        let mut wire = Vec::new();
+        write_secret(&mut wire, b"test-only-secret").await.unwrap();
+        let received = read_secret(&mut wire.as_slice()).await.unwrap();
+        assert_eq!(received.as_slice(), b"test-only-secret");
+        for length in [0u32, MAX_PASSWORD_BYTES as u32 + 1, u32::MAX] {
+            assert!(
+                read_secret(&mut length.to_be_bytes().as_slice())
+                    .await
+                    .is_err()
+            );
+        }
+        for invalid in [b"".as_slice(), b"a\0b", b"\xff"] {
+            assert!(write_secret(&mut Vec::new(), invalid).await.is_err());
+        }
     }
 }

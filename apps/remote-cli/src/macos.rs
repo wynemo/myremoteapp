@@ -137,6 +137,25 @@ pub struct CaptureSession {
     stream: SCStream,
     pub source: PreviewSource,
     input: Option<Arc<super::input_macos::MacInput>>,
+    paused: Arc<AtomicBool>,
+    sender: watch::Sender<Option<CaptureEvent>>,
+}
+
+impl CaptureSession {
+    pub fn paused_for_lock(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+    pub fn pause_for_lock(&self) {
+        if !self.paused.swap(true, Ordering::AcqRel) {
+            if let Some(input) = &self.input {
+                input.stop();
+            }
+            self.sender.send_replace(Some(CaptureEvent::Stopped(
+                "Mac 已锁屏；重新连接后可输入密码解锁".into(),
+            )));
+            let _ = self.stream.stop_capture();
+        }
+    }
 }
 
 impl Drop for CaptureSession {
@@ -210,10 +229,15 @@ pub fn start(window_id: Option<u32>, view_only: bool) -> Result<CaptureSession> 
         .with_queue_depth(3);
     let (sender, receiver) = watch::channel(None);
     let errors = sender.clone();
+    let paused = Arc::new(AtomicBool::new(false));
+    let paused_error = paused.clone();
     let stopped_input = input.clone();
     let delegate = StreamCallbacks::new().on_error(move |error| {
         if let Some(input) = &stopped_input {
             input.stop();
+        }
+        if is_locked() {
+            paused_error.store(true, Ordering::Release);
         }
         eprintln!("窗口采集停止：{error}");
         errors.send_replace(Some(CaptureEvent::Stopped(error.to_string())));
@@ -221,7 +245,8 @@ pub fn start(window_id: Option<u32>, view_only: bool) -> Result<CaptureSession> 
     let mut stream = SCStream::new_with_delegate(&filter, &configuration, delegate)?;
     stream.add_output_handler(
         Handler {
-            sender,
+            sender: sender.clone(),
+            paused: paused.clone(),
             busy: Mutex::new(()),
             sequence: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
@@ -239,6 +264,8 @@ pub fn start(window_id: Option<u32>, view_only: bool) -> Result<CaptureSession> 
     Ok(CaptureSession {
         stream,
         input: input.clone(),
+        paused,
+        sender,
         source: PreviewSource {
             window: WindowInfo {
                 width,
@@ -259,6 +286,7 @@ struct Handler {
     busy: Mutex<()>,
     sequence: AtomicU64,
     stopped: AtomicBool,
+    paused: Arc<AtomicBool>,
     input: Option<Arc<super::input_macos::MacInput>>,
 }
 
@@ -268,11 +296,12 @@ impl SCStreamOutputTrait for Handler {
             return;
         }
         if is_locked() {
+            self.paused.store(true, Ordering::Release);
             if !self.stopped.swap(true, Ordering::Relaxed) {
                 if let Some(input) = &self.input {
                     input.stop();
                 }
-                let reason = "Mac 已锁屏，请解锁后重新启动共享";
+                let reason = "Mac 已锁屏；重新连接后可输入密码解锁";
                 eprintln!("{reason}");
                 self.sender
                     .send_replace(Some(CaptureEvent::Stopped(reason.into())));

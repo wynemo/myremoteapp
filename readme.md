@@ -2,7 +2,7 @@
 
 在 Windows 上观看并用鼠标操作 Mac 的指定 App 窗口，支持 SOCKS5 代理。
 
-**当前支持点击、双击、拖拽和滚轮，键盘输入尚未实现。Mac 需要保持解锁。**
+**当前支持点击、双击、拖拽和滚轮，键盘输入尚未实现。Mac 首次选择窗口时需要解锁。**
 
 ## Mac：选择共享窗口
 
@@ -34,6 +34,6 @@ cargo run --locked --release -p remote-cli -- serve
 
 鼠标操作会激活 Mac 上的目标窗口并影响本地鼠标。只观看时可在连接命令后加 `--view-only`。
 
-Mac 按 `Ctrl+C` 停止共享；换窗口时重新运行并选择。锁屏或目标窗口关闭会结束当前预览，需要解锁或重新选择窗口。
+Mac 按 `Ctrl+C` 停止共享；换窗口时重新运行并选择。Mac 锁屏时会暂停预览；再次连接时，在 Windows 终端输入 Mac 登录密码即可尝试解锁并恢复原窗口。密码不回显、不保存，也不自动重试。目标窗口关闭后需要重新选择。
 
-连接文件相当于访问密码；`serve --reset-pairing` 会让旧文件失效。更多用法见 [TECHNICAL.md](TECHNICAL.md)。
+服务必须已在 Mac 上启动；此功能不处理开机前的磁盘解锁。连接文件相当于访问密码；`serve --reset-pairing` 会让旧文件失效。更多用法见 [TECHNICAL.md](TECHNICAL.md)。

@@ -16,11 +16,14 @@ serde_json.workspace = true
 tempfile.workspace = true
 remote-protocol = { path = "../../crates/protocol" }
 jpeg-decoder.workspace = true
+zeroize.workspace = true
+rpassword.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit.workspace = true
 jpeg-encoder.workspace = true
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "libc", "NSRunningApplication"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSArray", "NSURL"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 minifb.workspace = true

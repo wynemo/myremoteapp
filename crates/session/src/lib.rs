@@ -1,8 +1,8 @@
 //! Authenticated diagnostic, video, and mouse-control sessions.
 use anyhow::{Result, bail};
 use remote_protocol::{
-    ErrorCode, Message, MouseEvent, PreviewFrame, VERSION, WindowInfo, end_preview, read_message,
-    write_frame, write_message,
+    ErrorCode, Message, MouseEvent, PreviewFrame, UnlockOutcome, VERSION, WindowInfo, end_preview,
+    read_message, read_secret, write_frame, write_message, write_secret,
 };
 use std::{
     sync::Arc,
@@ -39,6 +39,12 @@ pub trait InputSession: Send {
     fn release_all(&mut self);
 }
 
+pub trait UnlockHost: Send + Sync {
+    fn status(&self) -> (bool, bool);
+    fn unlock(&self, password: &[u8], cancelled: &std::sync::atomic::AtomicBool) -> UnlockOutcome;
+    fn capture_ready(&self) -> bool;
+}
+
 pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> Result<()> {
     serve_with_preview(stream, None).await
 }
@@ -46,6 +52,14 @@ pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> Result<
 pub async fn serve_with_preview<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     preview: Option<PreviewSource>,
+) -> Result<()> {
+    serve_with_host(stream, preview, None).await
+}
+
+pub async fn serve_with_host<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    preview: Option<PreviewSource>,
+    unlock: Option<Arc<dyn UnlockHost>>,
 ) -> Result<()> {
     let hello = timeout(IO_TIMEOUT, read_message(stream)).await??;
     match hello {
@@ -77,6 +91,53 @@ pub async fn serve_with_preview<S: AsyncRead + AsyncWrite + Unpin>(
         match timeout(IO_TIMEOUT, read_message(stream)).await?? {
             Message::Ping { sequence } => send(stream, &Message::Pong { sequence }).await?,
             Message::Goodbye => return Ok(()),
+            Message::GetStatus => {
+                let (locked, unlock_available) =
+                    unlock.as_ref().map_or((false, false), |host| host.status());
+                send(
+                    stream,
+                    &Message::Status {
+                        locked,
+                        unlock_available,
+                    },
+                )
+                .await?;
+            }
+            Message::Unlock => {
+                let password = timeout(IO_TIMEOUT, read_secret(stream)).await??;
+                let outcome = if let Some(host) = &unlock {
+                    let worker = host.clone();
+                    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+                    impl Drop for CancelOnDrop {
+                        fn drop(&mut self) {
+                            self.0.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                    }
+                    let _cancel = CancelOnDrop(cancelled.clone());
+                    let mut worker =
+                        tokio::task::spawn_blocking(move || worker.unlock(&password, &cancelled));
+                    let result = tokio::select! {
+                        result=&mut worker=>result,
+                        _=read_message(stream)=>return Ok(()),
+                    };
+                    let mut outcome = result.unwrap_or(UnlockOutcome::Unavailable);
+                    if outcome == UnlockOutcome::Unlocked {
+                        let deadline = Instant::now() + Duration::from_secs(8);
+                        while !host.capture_ready() && Instant::now() < deadline {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        if !host.capture_ready() {
+                            outcome = UnlockOutcome::WindowUnavailable;
+                        }
+                    }
+                    outcome
+                } else {
+                    UnlockOutcome::Unavailable
+                };
+                send(stream, &Message::UnlockResult { outcome }).await?;
+                return Ok(());
+            }
             Message::StartPreview => {
                 let Some(source) = preview else {
                     send(
@@ -159,6 +220,56 @@ pub async fn serve_with_preview<S: AsyncRead + AsyncWrite + Unpin>(
                 bail!("unexpected session message");
             }
         }
+    }
+}
+
+pub async fn remote_status<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> Result<(bool, bool)> {
+    send(stream, &Message::Hello { version: VERSION }).await?;
+    if timeout(IO_TIMEOUT, read_message(stream)).await?? != (Message::Welcome { version: VERSION })
+    {
+        bail!("服务端协议不兼容，请同时更新 Mac 和 Windows 程序");
+    }
+    send(stream, &Message::GetStatus).await?;
+    let Message::Status {
+        locked,
+        unlock_available,
+    } = timeout(IO_TIMEOUT, read_message(stream)).await??
+    else {
+        bail!("服务端不支持解锁状态查询，请更新 Mac 端")
+    };
+    send(stream, &Message::Goodbye).await?;
+    Ok((locked, unlock_available))
+}
+
+pub async fn unlock_remote<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    password: zeroize::Zeroizing<String>,
+) -> Result<()> {
+    send(stream, &Message::Hello { version: VERSION }).await?;
+    if timeout(IO_TIMEOUT, read_message(stream)).await?? != (Message::Welcome { version: VERSION })
+    {
+        bail!("解锁协议不兼容，请更新两端程序");
+    }
+    send(stream, &Message::Unlock).await?;
+    timeout(IO_TIMEOUT, write_secret(stream, password.as_bytes())).await??;
+    drop(password);
+    let result = timeout(Duration::from_secs(25), read_message(stream)).await??;
+    match result {
+        Message::UnlockResult {
+            outcome: UnlockOutcome::Unlocked,
+        } => Ok(()),
+        Message::UnlockResult {
+            outcome: UnlockOutcome::Rejected,
+        } => bail!("系统未解锁，密码可能不正确；本次不会自动重试"),
+        Message::UnlockResult {
+            outcome: UnlockOutcome::Busy,
+        } => bail!("解锁正在进行或尝试过于频繁，请稍后重试"),
+        Message::UnlockResult {
+            outcome: UnlockOutcome::WindowUnavailable,
+        } => bail!("Mac 已解锁，但原窗口未能恢复；请在 Mac 重新选择共享窗口"),
+        _ => bail!("当前无法解锁，请检查 Mac 的辅助功能权限及系统登录界面"),
     }
 }
 
@@ -459,5 +570,145 @@ mod tests {
                 .contains("辅助功能")
         );
         assert!(host.await.unwrap().is_err());
+    }
+
+    struct TestUnlock {
+        locked: std::sync::atomic::AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
+        reject: bool,
+    }
+    impl UnlockHost for TestUnlock {
+        fn status(&self) -> (bool, bool) {
+            (self.locked.load(std::sync::atomic::Ordering::SeqCst), true)
+        }
+        fn capture_ready(&self) -> bool {
+            !self.locked.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn unlock(
+            &self,
+            password: &[u8],
+            cancelled: &std::sync::atomic::AtomicBool,
+        ) -> UnlockOutcome {
+            assert!(!cancelled.load(std::sync::atomic::Ordering::Acquire));
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.reject || password != b"test-only-secret" {
+                UnlockOutcome::Rejected
+            } else {
+                self.locked
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                UnlockOutcome::Unlocked
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn status_and_one_shot_password_unlock_use_separate_sessions() {
+        let host = Arc::new(TestUnlock {
+            locked: std::sync::atomic::AtomicBool::new(true),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            reject: false,
+        });
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        let backend = host.clone();
+        let task =
+            tokio::spawn(async move { serve_with_host(&mut server, None, Some(backend)).await });
+        assert_eq!(remote_status(&mut client).await.unwrap(), (true, true));
+        task.await.unwrap().unwrap();
+        assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        let backend = host.clone();
+        let task =
+            tokio::spawn(async move { serve_with_host(&mut server, None, Some(backend)).await });
+        unlock_remote(
+            &mut client,
+            zeroize::Zeroizing::new("test-only-secret".into()),
+        )
+        .await
+        .unwrap();
+        task.await.unwrap().unwrap();
+        assert_eq!(host.status(), (false, true));
+        assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_password_is_not_retried_or_returned_in_error() {
+        let host = Arc::new(TestUnlock {
+            locked: std::sync::atomic::AtomicBool::new(true),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            reject: true,
+        });
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        let backend = host.clone();
+        let task =
+            tokio::spawn(async move { serve_with_host(&mut server, None, Some(backend)).await });
+        let error = unlock_remote(
+            &mut client,
+            zeroize::Zeroizing::new("test-only-secret".into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.to_string().contains("test-only-secret"));
+        assert!(error.to_string().contains("不会自动重试"));
+        task.await.unwrap().unwrap();
+        assert_eq!(host.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    struct CancellableUnlock {
+        entered: tokio::sync::Notify,
+        finished: tokio::sync::Notify,
+        cancelled: std::sync::atomic::AtomicBool,
+    }
+    impl UnlockHost for CancellableUnlock {
+        fn status(&self) -> (bool, bool) {
+            (true, true)
+        }
+        fn capture_ready(&self) -> bool {
+            false
+        }
+        fn unlock(
+            &self,
+            _password: &[u8],
+            cancelled: &std::sync::atomic::AtomicBool,
+        ) -> UnlockOutcome {
+            self.entered.notify_one();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !cancelled.load(std::sync::atomic::Ordering::Acquire) && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.cancelled.store(
+                cancelled.load(std::sync::atomic::Ordering::Acquire),
+                std::sync::atomic::Ordering::Release,
+            );
+            self.finished.notify_one();
+            UnlockOutcome::Unavailable
+        }
+    }
+    #[tokio::test]
+    async fn disconnect_cancels_pending_password_submission() {
+        let host = Arc::new(CancellableUnlock {
+            entered: tokio::sync::Notify::new(),
+            finished: tokio::sync::Notify::new(),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        let backend = host.clone();
+        let task =
+            tokio::spawn(async move { serve_with_host(&mut server, None, Some(backend)).await });
+        write_message(&mut client, &Message::Hello { version: VERSION })
+            .await
+            .unwrap();
+        read_message(&mut client).await.unwrap();
+        write_message(&mut client, &Message::Unlock).await.unwrap();
+        write_secret(&mut client, b"test-only-secret")
+            .await
+            .unwrap();
+        host.entered.notified().await;
+        drop(client);
+        task.await.unwrap().unwrap();
+        timeout(Duration::from_secs(1), host.finished.notified())
+            .await
+            .unwrap();
+        assert!(host.cancelled.load(std::sync::atomic::Ordering::Acquire));
     }
 }

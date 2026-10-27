@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-type Ref = *const c_void;
+pub(crate) type Ref = *const c_void;
 #[derive(Debug, Default, Copy, Clone)]
 #[repr(C)]
 pub struct Point {
@@ -78,7 +78,7 @@ unsafe extern "C" {
     fn AXValueGetValue(value: Ref, kind: u32, output: *mut c_void) -> bool;
 }
 
-struct Owned(Ref);
+pub(crate) struct Owned(pub(crate) Ref);
 impl Drop for Owned {
     fn drop(&mut self) {
         if !self.0.is_null() {
@@ -86,10 +86,10 @@ impl Drop for Owned {
         }
     }
 }
-fn string(value: &std::ffi::CStr) -> Owned {
+pub(crate) fn string(value: &std::ffi::CStr) -> Owned {
     Owned(unsafe { CFStringCreateWithCString(std::ptr::null(), value.as_ptr(), 0x0800_0100) })
 }
-fn attribute(element: Ref, name: &std::ffi::CStr) -> Option<Owned> {
+pub(crate) fn attribute(element: Ref, name: &std::ffi::CStr) -> Option<Owned> {
     let name = string(name);
     let mut result = std::ptr::null();
     (unsafe { AXUIElementCopyAttributeValue(element, name.0, &mut result) } == 0

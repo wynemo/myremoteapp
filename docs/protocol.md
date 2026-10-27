@@ -1,4 +1,4 @@
-# 控制通道 v2
+# 控制通道 v3
 
 本文描述当前实现。JPEG 预览、SOCKS5 TCP 和鼠标控制已实现；H.264、键盘及 WebRTC 尚未实现。
 
@@ -25,8 +25,8 @@
 
 | 方向 | 消息 | 说明 |
 | --- | --- | --- |
-| 客户端 → 服务端 | `{"type":"hello","version":2}` | 第一条应用消息 |
-| 服务端 → 客户端 | `{"type":"welcome","version":2}` | 版本协商成功 |
+| 客户端 → 服务端 | `{"type":"hello","version":3}` | 第一条应用消息 |
+| 服务端 → 客户端 | `{"type":"welcome","version":3}` | 版本协商成功 |
 | 客户端 → 服务端 | `{"type":"ping","sequence":1}` | 往返探测 |
 | 服务端 → 客户端 | `{"type":"pong","sequence":1}` | 原样返回序号 |
 | 客户端 → 服务端 | `{"type":"goodbye"}` | 结束诊断 |
@@ -52,7 +52,7 @@
 
 ## JPEG 窗口预览（已实现）
 
-当前 Hello/Welcome 版本为 2，两端需要同时更新。ping/pong/Goodbye 格式不变。客户端完成握手后发送 `{"type":"start_preview"}`，服务端返回 `preview_started` 消息，携带 `window`（id、app、title、width、height）。服务未选择窗口时返回 `no_window_selected` 错误并结束会话。旧服务不支持新消息，客户端会提示更新 Mac 端。
+当前 Hello/Welcome 版本为 3，两端需要同时更新。ping/pong/Goodbye 格式不变。客户端完成握手后发送 `{"type":"start_preview"}`，服务端返回 `preview_started` 消息，携带 `window`（id、app、title、width、height）。服务未选择窗口时返回 `no_window_selected` 错误并结束会话。旧服务不支持新消息，客户端会提示更新 Mac 端。
 
 `preview_started` 之后，这条连接只传预览记录，不再交织 JSON 控制消息：
 
@@ -67,7 +67,7 @@
 
 ## 独立鼠标控制连接（已实现）
 
-控制连接独立于 JPEG 视频连接，复用相同 TLS 双向设备认证、目标地址及 SOCKS5 路由。客户端先完成 Hello/Welcome v2，再发送 `start_control`（window_id 必须匹配当前共享窗口）。服务端返回 `control_ready`；仅观看服务返回 `control_unavailable`，已有控制者返回 `control_busy`。
+控制连接独立于 JPEG 视频连接，复用相同 TLS 双向设备认证、目标地址及 SOCKS5 路由。客户端先完成 Hello/Welcome v3，再发送 `start_control`（window_id 必须匹配当前共享窗口）。服务端返回 `control_ready`；仅观看服务返回 `control_unavailable`，已有控制者返回 `control_busy`。
 
 后续使用有界 JSON 控制消息：
 
@@ -78,3 +78,14 @@
 - `goodbye`：结束控制连接，释放控制权和按钮。
 
 视频帧序号在当前 capture stream 内唯一。Mac 保存最近 128 帧的坐标信息，校验当前窗口尺寸后映射；过期序号、已关闭窗口、锁屏或权限撤销均不继续注入。按钮松开/全部释放不受过期帧限制。控制会话通过 RAII 在 EOF、错误、超时和任务取消时释放按钮及独占控制权。
+
+
+## 手动密码解锁（v3）
+
+`get_status` 返回 `status`，含 locked 与 unlock_available。客户端结束状态查询会话后再从本地终端隐藏输入密码，避免用户输入期间持有会超时的网络会话。已解锁时不提示密码。
+
+解锁使用一条新的双向 TLS 会话：Hello/Welcome v3 → `unlock` → `[u32 大端长度][UTF-8 密码字节]` → `unlock_result`。密码记录上限 4096 字节，拒绝空值、NUL 和非法 UTF-8，不得序列化进 JSON/Debug 消息。临时密码缓冲区释放时清理。读取期限为 10 秒，客户端等待解锁响应上限 25 秒。
+
+outcome 为 unlocked、rejected、unavailable、busy 或 window_unavailable。每次请求只执行一次系统提交，错误响应不包含密码或底层系统错误详情。主机已解锁但窗口无法恢复时返回 window_unavailable。客户端不自动重试密码。客户端断开、结束或取消请求时，主机设置取消标志，原生代码在写入密码和提交前重新检查。
+
+服务端 unlock 后端仍受当前设备认证、控制台用户、系统签名和辅助功能权限约束；普通只观看/诊断服务不接受解锁。没有密码持久化、钥匙串或“记住密码”协议。
