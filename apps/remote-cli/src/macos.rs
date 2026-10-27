@@ -212,12 +212,14 @@ pub fn start(window_id: Option<u32>, view_only: bool) -> Result<CaptureSession> 
             .process_id();
         Some(super::input_macos::MacInput::new(selected.id, pid))
     };
-    let ratio = (1280.0 / selected.width as f64)
-        .min(720.0 / selected.height as f64)
-        .min(1.0);
-    let width = (selected.width as f64 * ratio).round().max(1.0) as u32;
-    let height = (selected.height as f64 * ratio).round().max(1.0) as u32;
     let filter = SCContentFilter::create().with_window(window).build()?;
+    let rect = filter.content_rect();
+    let (width, height) = capture_dimensions(
+        rect.size.width,
+        rect.size.height,
+        f64::from(filter.point_pixel_scale()),
+    );
+    println!("共享画面：{width}×{height}，10 FPS，高清文字模式。");
     let configuration = SCStreamConfiguration::new()
         .with_width(width)
         .with_height(height)
@@ -356,7 +358,10 @@ impl Handler {
             packed.extend_from_slice(&row[..width * 4]);
         }
         let mut jpeg = Vec::new();
-        jpeg_encoder::Encoder::new(&mut jpeg, 75).encode(
+        let mut encoder = jpeg_encoder::Encoder::new(&mut jpeg, 95);
+        // Preserve full chroma resolution: subsampling smears colored UI text.
+        encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::R_4_4_4);
+        encoder.encode(
             &packed,
             width as u16,
             height as u16,
@@ -392,5 +397,38 @@ impl Handler {
             sequence,
             jpeg,
         })
+    }
+}
+
+// Bound work by both orientation and pixel count, retaining native Retina pixels
+// for ordinary app windows instead of first reducing them to logical points.
+fn capture_dimensions(width: f64, height: f64, scale: f64) -> (u32, u32) {
+    let scale = if scale.is_finite() && scale >= 1.0 {
+        scale
+    } else {
+        1.0
+    };
+    let width = width.max(1.0) * scale;
+    let height = height.max(1.0) * scale;
+    let ratio = (2560.0 / width.max(height))
+        .min(1440.0 / width.min(height))
+        .min(1.0);
+    (
+        (width * ratio).round().max(1.0) as u32,
+        (height * ratio).round().max(1.0) as u32,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capture_dimensions;
+
+    #[test]
+    fn keeps_retina_detail_and_bounds_both_orientations() {
+        assert_eq!(capture_dimensions(420.0, 702.0, 2.0), (840, 1404));
+        assert_eq!(capture_dimensions(420.0, 702.0, 1.0), (420, 702));
+        assert_eq!(capture_dimensions(1920.0, 1080.0, 2.0), (2560, 1440));
+        assert_eq!(capture_dimensions(1080.0, 1920.0, 2.0), (1440, 2560));
+        assert_eq!(capture_dimensions(1000.0, 1000.0, 2.0), (1440, 1440));
     }
 }

@@ -3,12 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, ErrorKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 pub const MAX_PASSWORD_BYTES: usize = 4096;
 pub const MAX_CONTROL_BYTES: usize = 64 * 1024;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
-pub const MAX_FRAME_WIDTH: u32 = 1920;
-pub const MAX_FRAME_HEIGHT: u32 = 1080;
+pub const MAX_FRAME_WIDTH: u32 = 2560;
+pub const MAX_FRAME_HEIGHT: u32 = 2560;
+pub const MAX_FRAME_PIXELS: usize = 2560 * 1440;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -151,7 +152,12 @@ pub enum ErrorCode {
 }
 
 pub fn validate_frame_size(width: u32, height: u32) -> io::Result<()> {
-    if width == 0 || height == 0 || width > MAX_FRAME_WIDTH || height > MAX_FRAME_HEIGHT {
+    if width == 0
+        || height == 0
+        || width > MAX_FRAME_WIDTH
+        || height > MAX_FRAME_HEIGHT
+        || u64::from(width) * u64::from(height) > MAX_FRAME_PIXELS as u64
+    {
         return Err(invalid_data("invalid preview dimensions"));
     }
     Ok(())
@@ -232,6 +238,14 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_dimensions_support_portrait_with_bounded_memory() {
+        assert!(validate_frame_size(1440, 2560).is_ok());
+        assert!(validate_frame_size(2560, 1440).is_ok());
+        assert!(validate_frame_size(2560, 2560).is_err());
+        assert!(validate_frame_size(0, 100).is_err());
+    }
 
     #[tokio::test]
     async fn messages_preserve_boundaries() {

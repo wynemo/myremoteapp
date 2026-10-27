@@ -18,7 +18,7 @@ pub struct DecodedFrame {
 pub fn decode(frame: &PreviewFrame) -> Result<DecodedFrame> {
     remote_protocol::validate_frame_size(frame.width, frame.height)?;
     let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(&frame.jpeg));
-    decoder.set_max_decoding_buffer_size(1920 * 1080 * 4);
+    decoder.set_max_decoding_buffer_size(remote_protocol::MAX_FRAME_PIXELS * 4);
     decoder.read_info().context("无法读取 JPEG 帧头")?;
     let info = decoder.info().context("缺少 JPEG 帧头")?;
     ensure!(
@@ -233,6 +233,32 @@ mod tests {
         assert_eq!((frame.width, frame.height, frame.pixels.len()), (4, 4, 16));
         assert!((frame.pixels[0] >> 16) > 240);
         assert!((frame.pixels[0] & 0xff) < 16);
+    }
+
+    #[test]
+    fn decodes_full_resolution_portrait() {
+        let mut jpeg = Vec::new();
+        let mut encoder = jpeg_encoder::Encoder::new(&mut jpeg, 95);
+        encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::R_4_4_4);
+        encoder
+            .encode(
+                &[255, 0, 0].repeat(1440 * 2560),
+                1440,
+                2560,
+                jpeg_encoder::ColorType::Rgb,
+            )
+            .unwrap();
+        let frame = decode(&PreviewFrame {
+            width: 1440,
+            height: 2560,
+            sequence: 1,
+            jpeg,
+        })
+        .unwrap();
+        assert_eq!(
+            (frame.width, frame.height, frame.pixels.len()),
+            (1440, 2560, 1440 * 2560)
+        );
     }
 
     #[test]
