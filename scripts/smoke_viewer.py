@@ -53,10 +53,16 @@ def gray_jpeg(width, height):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=pathlib.Path)
+    parser.add_argument("--test-mouse", action="store_true",
+                        help="macOS local input regression check (requires Accessibility)")
     args = parser.parse_args()
     binary = args.binary.resolve()
     with tempfile.TemporaryDirectory(prefix="myremoteapp-viewer-") as directory:
         root = pathlib.Path(directory)
+        input_helper = root / "viewer-input"
+        if args.test_mouse:
+            subprocess.run(["xcrun", "swiftc", str(pathlib.Path(__file__).with_name("smoke_viewer_input.swift")),
+                            "-o", str(input_helper)], check=True, capture_output=True)
         provision = subprocess.Popen(
             [str(binary), "serve", "--check-only", "--listen", "127.0.0.1:0",
              "--state-dir", str(root / "host")],
@@ -128,7 +134,7 @@ def main():
                         send(stream, {"type": "control_ready"})
                         while True:
                             message = receive(stream)
-                            received.append(message["type"])
+                            received.append(message)
                             if message["type"] == "ping":
                                 send(stream, {"type": "pong", "sequence": message["sequence"]})
                             elif message["type"] == "goodbye":
@@ -150,10 +156,20 @@ def main():
         server_thread = threading.Thread(target=server, daemon=True)
         server_thread.start()
         try:
-            result = subprocess.run(
+            client = subprocess.Popen(
                 [str(binary), "connect", "--address", address, "--connection-file",
                  str(root / "host" / "connect.json")],
-                capture_output=True, text=True, encoding="utf-8", timeout=25)
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+            try:
+                if args.test_mouse:
+                    subprocess.run([str(input_helper), str(client.pid)], check=True,
+                                   capture_output=True, timeout=10)
+                stdout, stderr = client.communicate(timeout=25)
+                result = subprocess.CompletedProcess(client.args, client.returncode, stdout, stderr)
+            finally:
+                if client.poll() is None:
+                    client.kill()
+                    client.communicate()
             server_thread.join(timeout=2)
             for worker in workers:
                 worker.join(timeout=2)
@@ -161,7 +177,14 @@ def main():
             assert video_done.is_set(), "synthetic video did not finish"
             assert "320×180" in result.stdout and "180×320" in result.stdout, result
             assert result.returncode == 1 and "采集已停止" in result.stderr, result
-            assert "ping" in received and "release_input" in received and "goodbye" in received, received
+            kinds = [message["type"] for message in received]
+            assert "ping" in kinds and "release_input" in kinds and "goodbye" in kinds, received
+            if args.test_mouse:
+                actions = [message["event"]["kind"] for message in received if message["type"] == "mouse"]
+                for button in ["left", "right"]:
+                    for down in [True, False]:
+                        assert {"action": "button", "button": button, "down": down} in actions, actions
+                print("Native mouse: focused macOS viewer sends left/right down and up over TLS.")
             print("Native viewer: landscape/portrait decode and presentation, authenticated control heartbeat, stop and input release passed.")
         finally:
             listener.close()

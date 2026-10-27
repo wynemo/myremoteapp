@@ -99,6 +99,20 @@ fn native_window(title: &str, frame: &DecodedFrame) -> Result<minifb::Window> {
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
+fn viewer_active(window: &minifb::Window) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // minifb 0.29's macOS is_active() reverses the native boolean.
+        // Query the actual NSWindow rather than depending on that wrapper.
+        // The handle is minifb's live NSWindow and this runs on the main thread.
+        let native = unsafe { &*window.get_window_handle().cast::<objc2_app_kit::NSWindow>() };
+        native.isKeyWindow()
+    }
+    #[cfg(target_os = "windows")]
+    window.is_active()
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut stream: S,
     control: Option<S>,
@@ -194,7 +208,7 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                 window.get_mouse_down(MouseButton::Middle),
                             ],
                             scroll: window.get_scroll_wheel(),
-                            active: window.is_active(),
+                            active: viewer_active(&window),
                         }) {
                             input.send(event)?;
                         }

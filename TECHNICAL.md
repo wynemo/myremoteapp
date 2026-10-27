@@ -23,6 +23,8 @@ cargo clippy --locked --release --workspace --all-targets -- -D warnings
 
 Mac 源码构建使用 Xcode 26.3 或更新版本，采集依赖需要 macOS 26 SDK；发布二进制使用系统 Swift 运行库，用户无需安装 Swift。当前运行验证环境为 macOS 26，旧版本 macOS 尚未验证。窗口采集需要屏幕录制权限。
 
+原生客户端回归检查：`python3 scripts/smoke_viewer.py --binary target/release/remote-cli`。macOS 本机可加 `--test-mouse`，在辅助功能权限允许时，仅向测试预览窗口发送左/右键事件并核对 TLS 控制消息；此检查曾复现旧版焦点判断反转导致点击丢失的问题。
+
 Mac 本机构建产物为 `target/release/remote-cli`。本机不安装 Windows 工具链、不交叉编译 Windows；Windows 构建和测试交给 GitHub Actions 的 Windows runner，具体约定见 [AGENTS.md](AGENTS.md)。
 
 ## 连接文件与服务端
