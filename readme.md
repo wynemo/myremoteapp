@@ -8,7 +8,7 @@
 
 尚未实现窗口采集、H.264 编解码、系统输入注入、Windows 原生界面、SOCKS5、WebRTC、视频传输与自动降级。当前命令行只验证控制通道，不代表已经可以远程控制窗口，也不测量画面或输入的端到端延迟。
 
-按照 [AGENTS.md](AGENTS.md)，**不执行 Windows 编译**。当前阶段只在 macOS 本机验证共享模块和 CLI；Windows 端未编译、未运行。
+按照 [AGENTS.md](AGENTS.md)，本机只验证 macOS；Windows 原生构建和测试由 GitHub Actions 的 Windows runner 执行，不在 Mac 上交叉编译。
 
 ## 架构与边界
 
@@ -35,7 +35,20 @@ crates/transport     TLS 1.3、双向证书认证、ALPN
 apps/remote-cli      init / serve / probe
 ```
 
-后续加入 `host-macos` 与 `client-windows` 平台模块。当前不创建空的 Windows crate，不触发 Windows 构建。
+后续加入 `host-macos` 与 `client-windows` 平台模块。当前两种平台的 CI 都构建共享诊断 CLI。
+
+## 自动构建与下载
+
+[GitHub Actions](https://github.com/wynemo/myremoteapp/actions/workflows/ci.yml) 在分支推送、Pull Request 和手动触发时执行两平台 Release 构建：
+
+| 平台 | Runner | 目标 | 产物 |
+| --- | --- | --- | --- |
+| Windows x64 | windows-2022 | x86_64-pc-windows-msvc | ZIP，含 remote-cli.exe |
+| macOS ARM64 | macos-14 | aarch64-apple-darwin | tar.gz，含 remote-cli |
+
+两平台均固定 Rust 1.98.0，执行格式检查、Clippy、现有测试、Release 编译和原生二进制 `--help` 验证。打包前校验 PE/Mach-O 架构，生成 SHA-256 校验文件。构建产物保留 30 天，在对应运行页面的 Artifacts 下载。
+
+推送与 Cargo.toml 版本一致的标签（如 `v0.1.0`）时，两平台构建成功后自动发布 [GitHub Release](https://github.com/wynemo/myremoteapp/releases)。日常分支推送只上传 Artifacts。当前下载包仅含命令行诊断工具和说明文档，尚未提供图形化远程控制客户端；macOS 包未做 Developer ID 签名及公证。
 
 ## 在 macOS 本机运行
 
@@ -77,7 +90,7 @@ cargo run -p remote-cli -- probe \
 
 1. **Mac 本地采集验证**：窗口枚举与选择、屏幕录制权限、指定窗口预览；验证遮挡、最小化、缩放及窗口关闭。
 2. **硬件编码与视频通道**：VideoToolbox H.264 实时编码；设计独立视频连接、时间戳、尺寸版本、SPS/PPS 与 IDR 恢复；先在 Mac 本地验证码流。
-3. **Windows 客户端源码**：Win32 窗口、Media Foundation 解码和 D3D11 渲染。遵守不编译 Windows 的约定，仅编写和审查源码，运行验证留待用户后续授权。
+3. **Windows 客户端源码**：Win32 窗口、Media Foundation 解码和 D3D11 渲染。本机编写和审查源码，通过 GitHub Actions Windows runner 原生构建与验证。
 4. **输入闭环**：坐标映射、焦点校验、组合键、Unicode 文本、拖拽；断线释放按键；逐 App 验证。
 5. **代理连接**：SOCKS5 CONNECT、认证、DNS 策略和 TLS 内层加密；UDP ASSOCIATE 单独探测。
 6. **WebRTC 优先**：验证 Rust 库 H.264 与自定义网络 I/O；直接/代理 UDP 探测失败后切换 TLS/TCP，切换时从新 IDR 恢复。

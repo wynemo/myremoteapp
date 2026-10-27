@@ -2,7 +2,7 @@
 
 ## 构建与验证
 
-- 不要执行 Windows 编译，包括交叉编译、Windows target 的 `cargo build` / `cargo check` / `cargo test`，以及通过 CI、虚拟机或远程机器触发的 Windows 构建。
-- 可以编写和审查 Windows 端代码，但验证仅限当前 macOS 环境可运行的共享模块和 macOS 端代码。
-- 汇报验证结果时，明确说明 Windows 端未编译、未运行，不要将 macOS 上的验证描述为 Windows 验证通过。
-- 只有用户后续明确授权 Windows 编译时，才能调整上述限制。
+- 不在 macOS 本机安装 Windows 工具链、SDK 或交叉编译 Windows；本机只验证 macOS 与共享模块。
+- 用户已授权通过 GitHub Actions 的 Windows runner 原生构建和验证 Windows 产物。Windows 构建交给 CI，不使用本机交叉编译、虚拟机或其他远程机器替代。
+- CI 的构建、测试及 Clippy 使用 Release 模式，依赖使用 `--locked`。
+- 汇报时区分本机 macOS 验证与 Windows CI 验证；只有 Windows CI 实际通过后，才能声称 Windows 构建或测试通过。

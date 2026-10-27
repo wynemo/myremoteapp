@@ -51,12 +51,14 @@ fn load_identity(directory: &Path) -> Result<Identity> {
 
 fn init(directory: &Path) -> Result<()> {
     let generated = rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_owned()])?;
-    let mut builder = fs::DirBuilder::new();
+    let builder = fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut builder = builder;
         builder.mode(0o700);
-    }
+        builder
+    };
     builder
         .create(directory)
         .context("create a new identity directory (parent must exist)")?;
