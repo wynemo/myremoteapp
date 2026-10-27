@@ -10,6 +10,7 @@ rustls.workspace = true
 rustls-pemfile.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
+tokio-socks.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true

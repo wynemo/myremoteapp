@@ -2,3 +2,5 @@
 /.local/
 /dist/
 __pycache__/
+connect.json
+identity.json

@@ -11,3 +11,6 @@ rcgen.workspace = true
 remote-session = { path = "../../crates/session" }
 remote-transport = { path = "../../crates/transport" }
 tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

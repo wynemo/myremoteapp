@@ -8,10 +8,17 @@ use rustls::{
 use std::{io::BufReader, sync::Arc, time::Duration};
 use tokio::{net::TcpStream, time::timeout};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_socks::tcp::Socks5Stream;
 
 pub const ALPN: &[u8] = b"myremoteapp-control/1";
 pub const SERVER_NAME: &str = "remoteapp.local";
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A required proxy route. Failure never falls back to a direct connection.
+pub struct Socks5Proxy {
+    pub address: String,
+    pub credentials: Option<(String, String)>,
+}
 
 pub struct Identity {
     certs: Vec<CertificateDer<'static>>,
@@ -74,8 +81,44 @@ pub async fn connect(
     address: &str,
     config: Arc<ClientConfig>,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    connect_via(address, config, None).await
+}
+
+pub async fn connect_via(
+    address: &str,
+    config: Arc<ClientConfig>,
+    proxy: Option<&Socks5Proxy>,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
     timeout(CONNECT_TIMEOUT, async {
-        let tcp = TcpStream::connect(address).await?;
+        let tcp = if let Some(proxy) = proxy {
+            let stream = if let Some((username, password)) = &proxy.credentials {
+                ensure!(
+                    (1..=255).contains(&username.len()),
+                    "SOCKS5 username must be 1-255 bytes"
+                );
+                ensure!(
+                    (1..=255).contains(&password.len()),
+                    "SOCKS5 password must be 1-255 bytes"
+                );
+                Socks5Stream::connect_with_password(
+                    proxy.address.as_str(),
+                    address,
+                    username,
+                    password,
+                )
+                .await
+                .context("SOCKS5 authentication or CONNECT failed")?
+            } else {
+                Socks5Stream::connect(proxy.address.as_str(), address)
+                    .await
+                    .context("SOCKS5 CONNECT failed")?
+            };
+            stream.into_inner()
+        } else {
+            TcpStream::connect(address)
+                .await
+                .context("direct connection failed")?
+        };
         tcp.set_nodelay(true)?;
         let stream = TlsConnector::from(config)
             .connect(ServerName::try_from(SERVER_NAME)?, tcp)
@@ -171,5 +214,159 @@ mod tests {
         });
         assert!(connect(&address, client).await.is_err());
         host.await.unwrap();
+    }
+
+    // The fake proxy deliberately maps an otherwise unresolvable domain to the
+    // loopback host, verifying that the client sends DNS names through SOCKS5.
+    async fn proxy_server(
+        listener: TcpListener,
+        target: std::net::SocketAddr,
+        require_password: bool,
+        reject: bool,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut socket, _) = listener.accept().await.unwrap();
+        assert_eq!(socket.read_u8().await.unwrap(), 5);
+        let mut methods = vec![0; socket.read_u8().await.unwrap() as usize];
+        socket.read_exact(&mut methods).await.unwrap();
+        let method = if require_password { 2 } else { 0 };
+        assert!(methods.contains(&method));
+        socket.write_all(&[5, method]).await.unwrap();
+        if require_password {
+            assert_eq!(socket.read_u8().await.unwrap(), 1);
+            let mut user = vec![0; socket.read_u8().await.unwrap() as usize];
+            socket.read_exact(&mut user).await.unwrap();
+            let mut password = vec![0; socket.read_u8().await.unwrap() as usize];
+            socket.read_exact(&mut password).await.unwrap();
+            assert_eq!(user, b"proxy-user");
+            let valid = password == b"proxy-password";
+            socket.write_all(&[1, u8::from(!valid)]).await.unwrap();
+            if !valid {
+                return;
+            }
+        }
+        let mut header = [0; 4];
+        socket.read_exact(&mut header).await.unwrap();
+        assert_eq!(&header[..3], &[5, 1, 0]);
+        match header[3] {
+            3 => {
+                let mut domain = vec![0; socket.read_u8().await.unwrap() as usize];
+                socket.read_exact(&mut domain).await.unwrap();
+                assert_eq!(domain, b"mac.test.invalid");
+            }
+            1 => {
+                let mut ip = [0; 4];
+                socket.read_exact(&mut ip).await.unwrap();
+            }
+            kind => panic!("unexpected address kind {kind}"),
+        }
+        assert_eq!(socket.read_u16().await.unwrap(), target.port());
+        if reject {
+            socket
+                .write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            return;
+        }
+        let mut upstream = TcpStream::connect(target).await.unwrap();
+        socket
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+            .await
+            .unwrap();
+        // The application may close TLS without close_notify after goodbye.
+        let _ = tokio::io::copy_bidirectional(&mut socket, &mut upstream).await;
+    }
+
+    async fn check_proxy(require_password: bool) {
+        let (host, host_cert) = identity();
+        let (client, client_cert) = identity();
+        let server_config = server_config(host, &client_cert).unwrap();
+        let client_config = client_config(client, &host_cert).unwrap();
+        let host = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = host.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = Socks5Proxy {
+            address: listener.local_addr().unwrap().to_string(),
+            credentials: require_password.then(|| ("proxy-user".into(), "proxy-password".into())),
+        };
+        let proxy_task = tokio::spawn(proxy_server(listener, target, require_password, false));
+        let host_task = tokio::spawn(async move {
+            let (tcp, _) = host.accept().await.unwrap();
+            let mut stream = accept(tcp, server_config).await.unwrap();
+            remote_session::serve(&mut stream).await.unwrap();
+        });
+        let mut stream = connect_via(
+            &format!("mac.test.invalid:{}", target.port()),
+            client_config,
+            Some(&proxy),
+        )
+        .await
+        .unwrap();
+        remote_session::probe(&mut stream).await.unwrap();
+        drop(stream);
+        host_task.await.unwrap();
+        proxy_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks5_no_auth_with_remote_dns_and_tls() {
+        check_proxy(false).await;
+    }
+
+    #[tokio::test]
+    async fn socks5_password_with_remote_dns_and_tls() {
+        check_proxy(true).await;
+    }
+
+    #[tokio::test]
+    async fn socks5_refusal_does_not_fall_back_to_reachable_host() {
+        let (client, _) = identity();
+        let (_, host_cert) = identity();
+        let client_config = client_config(client, &host_cert).unwrap();
+        let host = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = host.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = Socks5Proxy {
+            address: listener.local_addr().unwrap().to_string(),
+            credentials: None,
+        };
+        let task = tokio::spawn(proxy_server(listener, target, false, true));
+        assert!(
+            connect_via(&target.to_string(), client_config, Some(&proxy))
+                .await
+                .is_err()
+        );
+        task.await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), host.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn socks5_wrong_password_is_rejected() {
+        let (client, _) = identity();
+        let (_, host_cert) = identity();
+        let client_config = client_config(client, &host_cert).unwrap();
+        let host = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = host.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = Socks5Proxy {
+            address: listener.local_addr().unwrap().to_string(),
+            credentials: Some(("proxy-user".into(), "wrong".into())),
+        };
+        let task = tokio::spawn(proxy_server(listener, target, true, false));
+        assert!(
+            connect_via(&target.to_string(), client_config, Some(&proxy))
+                .await
+                .is_err()
+        );
+        task.await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), host.accept())
+                .await
+                .is_err()
+        );
     }
 }

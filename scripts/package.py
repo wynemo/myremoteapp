@@ -52,6 +52,7 @@ def main() -> None:
     files = [
         (binary, executable),
         (ROOT / "readme.md", "readme.md"),
+        (ROOT / "TECHNICAL.md", "TECHNICAL.md"),
         (ROOT / "docs/protocol.md", "docs/protocol.md"),
     ]
     output = ROOT / "dist"
