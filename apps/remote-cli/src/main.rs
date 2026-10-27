@@ -2,7 +2,7 @@
 mod input_macos;
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
 mod mouse;
 mod pairing;
 mod preview;
@@ -201,7 +201,7 @@ async fn main() -> Result<()> {
             let slots = Arc::new(Semaphore::new(8));
             println!("服务已启动：{}（Ctrl-C 停止）", listener.local_addr()?);
             println!(
-                "把 {} 复制到 Windows 的 remote-cli.exe 旁边即可，无需手动配置证书。",
+                "把 {} 复制到客户端当前目录即可，无需手动配置证书。",
                 state_dir.join("connect.json").display()
             );
             println!("连接文件相当于访问密码；--reset-pairing 可让旧文件失效。");

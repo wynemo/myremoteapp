@@ -80,7 +80,7 @@ pub async fn save_frame<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn native_window(title: &str, frame: &DecodedFrame) -> Result<minifb::Window> {
     use minifb::{ScaleMode, Window, WindowOptions};
     let mut window = Window::new(
@@ -93,12 +93,12 @@ fn native_window(title: &str, frame: &DecodedFrame) -> Result<minifb::Window> {
             ..WindowOptions::default()
         },
     )
-    .context("无法创建 Windows 预览窗口")?;
+    .context("无法创建预览窗口")?;
     window.set_target_fps(60);
     Ok(window)
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut stream: S,
     control: Option<S>,
@@ -213,14 +213,12 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     result
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     _stream: S,
     _control: Option<S>,
 ) -> Result<()> {
-    bail!(
-        "图形预览目前在 Windows 提供；Mac 可用 --save-frame preview.jpg 验证采集，或用 --check-only 检查连接"
-    )
+    bail!("图形预览支持 macOS 和 Windows；当前平台可用 --save-frame preview.jpg 或 --check-only")
 }
 
 #[cfg(test)]

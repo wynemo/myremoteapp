@@ -109,7 +109,7 @@ impl MouseTracker {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 mod connection {
     use super::*;
     use anyhow::{Result, bail};
@@ -224,7 +224,7 @@ mod connection {
         }
     }
 }
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub use connection::{ControlClient, Status};
 
 #[cfg(test)]
