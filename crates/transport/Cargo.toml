@@ -1,0 +1,16 @@
+[package]
+name = "remote-transport"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+remote-session = { path = "../session" }

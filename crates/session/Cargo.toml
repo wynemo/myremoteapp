@@ -1,0 +1,10 @@
+[package]
+name = "remote-session"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+remote-protocol = { path = "../protocol" }
+tokio.workspace = true

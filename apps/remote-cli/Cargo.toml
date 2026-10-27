@@ -1,0 +1,13 @@
+[package]
+name = "remote-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rcgen.workspace = true
+remote-session = { path = "../../crates/session" }
+remote-transport = { path = "../../crates/transport" }
+tokio.workspace = true
