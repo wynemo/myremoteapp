@@ -1,3 +1,4 @@
+use super::workspace_macos::VirtualWorkspace;
 use anyhow::{Context, Result, bail, ensure};
 use remote_protocol::{PreviewFrame, WindowInfo};
 use remote_session::{CaptureEvent, PreviewSource};
@@ -14,6 +15,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
+use std::{rc::Rc, time::Duration};
 use tokio::sync::watch;
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -141,10 +143,23 @@ pub struct CaptureSession {
     input: Option<Arc<super::input_macos::MacInput>>,
     paused: Arc<AtomicBool>,
     sender: watch::Sender<Option<CaptureEvent>>,
+    workspace: Option<Rc<VirtualWorkspace>>,
 }
 
 impl CaptureSession {
+    pub fn resume(&self, view_only: bool) -> Result<Self> {
+        start_with_workspace(
+            Some(self.source.window.id),
+            view_only,
+            false,
+            self.workspace.clone(),
+        )
+    }
+
     pub fn refresh_resolution(&self) -> Result<()> {
+        if let Some(workspace) = &self.workspace {
+            workspace.ensure_ready()?;
+        }
         // Refresh filter metadata so resizing the app or moving it between
         // displays updates the stream, without replacing the connected source.
         let content = SCShareableContent::get()?;
@@ -154,6 +169,10 @@ impl CaptureSession {
             .find(|w| w.window_id() == self.source.window.id)
             .context("共享窗口已关闭")?;
         let filter = SCContentFilter::create().with_window(window).build()?;
+        ensure!(
+            self.workspace.is_none() || filter.point_pixel_scale() >= 1.9,
+            "共享窗口没有使用 HiDPI 渲染，请重新启动虚拟屏共享"
+        );
         let rect = filter.content_rect();
         let dimensions = capture_dimensions(
             rect.size.width,
@@ -198,7 +217,20 @@ impl Drop for CaptureSession {
     }
 }
 
-pub fn start(window_id: Option<u32>, view_only: bool) -> Result<CaptureSession> {
+pub fn start(
+    window_id: Option<u32>,
+    view_only: bool,
+    virtual_display: bool,
+) -> Result<CaptureSession> {
+    start_with_workspace(window_id, view_only, virtual_display, None)
+}
+
+fn start_with_workspace(
+    window_id: Option<u32>,
+    view_only: bool,
+    virtual_display: bool,
+    mut workspace: Option<Rc<VirtualWorkspace>>,
+) -> Result<CaptureSession> {
     let (content, windows) = available()?;
     let selected = if let Some(id) = window_id {
         windows
@@ -243,7 +275,22 @@ pub fn start(window_id: Option<u32>, view_only: bool) -> Result<CaptureSession> 
             .process_id();
         Some(super::input_macos::MacInput::new(selected.id, pid))
     };
-    let filter = SCContentFilter::create().with_window(window).build()?;
+    if virtual_display {
+        super::input_macos::require_permission()?;
+        let pid = window
+            .owning_application()
+            .context("目标 App 已退出")?
+            .process_id();
+        workspace = Some(Rc::new(VirtualWorkspace::create(selected.id, pid)?));
+        println!("已为共享 App 创建独立 HiDPI 工作区（1440×1080 点，2880×2160 像素）。");
+    }
+    if let Some(workspace) = &workspace {
+        workspace.ensure_ready()?;
+    }
+    // Moving to a display changes the app's backing scale asynchronously.
+    // Re-read the real window/filter metadata; never manufacture detail by
+    // multiplying the old 1x image size.
+    let filter = capture_filter(selected.id, workspace.is_some())?;
     let rect = filter.content_rect();
     let (width, height) = capture_dimensions(
         rect.size.width,
@@ -299,6 +346,7 @@ pub fn start(window_id: Option<u32>, view_only: bool) -> Result<CaptureSession> 
         stream,
         configuration,
         dimensions: Mutex::new((width, height)),
+        workspace,
         input: input.clone(),
         paused,
         sender,
@@ -315,6 +363,25 @@ pub fn start(window_id: Option<u32>, view_only: bool) -> Result<CaptureSession> 
             }),
         },
     })
+}
+
+fn capture_filter(window_id: u32, require_retina: bool) -> Result<SCContentFilter> {
+    for attempt in 0..40 {
+        let content = SCShareableContent::get()?;
+        let windows = content.windows();
+        let window = windows
+            .iter()
+            .find(|window| window.window_id() == window_id)
+            .context("选中的窗口已关闭")?;
+        let filter = SCContentFilter::create().with_window(window).build()?;
+        if !require_retina || filter.point_pixel_scale() >= 1.9 {
+            return Ok(filter);
+        }
+        if attempt < 39 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    bail!("目标 App 尚未切换到 HiDPI 渲染；请退出全屏/最小化后重新共享")
 }
 
 struct Handler {

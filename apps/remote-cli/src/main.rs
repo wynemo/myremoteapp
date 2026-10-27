@@ -8,6 +8,8 @@ mod pairing;
 mod preview;
 #[cfg(target_os = "macos")]
 mod unlock_macos;
+#[cfg(target_os = "macos")]
+mod workspace_macos;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -45,10 +47,13 @@ enum Command {
         /// 指定共享窗口 ID；省略时显示列表供选择。
         #[arg(long, conflicts_with = "check_only")]
         window_id: Option<u32>,
+        /// 将目标 App 移到独立 HiDPI 虚拟屏并放大；停止共享时尝试恢复窗口。
+        #[arg(long, conflicts_with = "check_only")]
+        virtual_display: bool,
         /// 只启动连接检查服务，不请求屏幕权限、不采集画面。
         #[arg(long)]
         check_only: bool,
-        /// 仅共享画面，不启用鼠标控制、不请求辅助功能权限。
+        /// 仅共享画面，不启用鼠标控制；虚拟屏模式仍需辅助功能权限来移动窗口。
         #[arg(long, conflicts_with = "check_only")]
         view_only: bool,
     },
@@ -162,6 +167,7 @@ async fn main() -> Result<()> {
             state_dir,
             reset_pairing,
             window_id,
+            virtual_display,
             check_only,
             view_only,
         } => {
@@ -170,13 +176,13 @@ async fn main() -> Result<()> {
             let mut capture = if check_only {
                 None
             } else {
-                Some(macos::start(window_id, view_only)?)
+                Some(macos::start(window_id, view_only, virtual_display)?)
             };
             #[cfg(target_os = "macos")]
             let mut preview = capture.as_ref().map(|capture| capture.source.clone());
             #[cfg(not(target_os = "macos"))]
             let preview = {
-                let _ = (window_id, view_only);
+                let _ = (window_id, view_only, virtual_display);
                 anyhow::ensure!(
                     check_only,
                     "窗口采集服务只能在 Mac 端启动；连接检查可用 --check-only"
@@ -209,10 +215,14 @@ async fn main() -> Result<()> {
                 println!("当前仅检查连接，未共享窗口。");
             }
             let mut maintenance = tokio::time::interval(Duration::from_secs(1));
+            let shutdown = shutdown_signal();
+            tokio::pin!(shutdown);
+            #[cfg(target_os = "macos")]
+            let mut resolution_error: Option<String> = None;
             loop {
                 let (tcp, address) = tokio::select! {
                     result = listener.accept() => result?,
-                    result = tokio::signal::ctrl_c() => { result?; break; }
+                    result = &mut shutdown => { result?; break; }
                     _=maintenance.tick()=>{
                         #[cfg(target_os = "macos")]
                         if let Some(current)=&capture {
@@ -220,8 +230,7 @@ async fn main() -> Result<()> {
                                 ready.store(false,Ordering::Release);
                                 current.pause_for_lock();
                             } else if current.paused_for_lock() || (!ready.load(Ordering::Acquire) && matches!(&*current.source.frames.borrow(),Some(remote_session::CaptureEvent::Stopped(_)))) {
-                                let id=current.source.window.id;
-                                match macos::start(Some(id),view_only) {
+                                match current.resume(view_only) {
                                     Ok(resumed)=>{
                                         preview=Some(resumed.source.clone());capture=Some(resumed);
                                         ready.store(true,Ordering::Release);
@@ -231,9 +240,16 @@ async fn main() -> Result<()> {
                                 }
                             } else if matches!(&*current.source.frames.borrow(),Some(remote_session::CaptureEvent::Frame(_))) {
                                 ready.store(true,Ordering::Release);
-                                // A failed metadata refresh leaves the existing
-                                // stream running; lock/stop recovery remains above.
-                                let _=current.refresh_resolution();
+                                match current.refresh_resolution() {
+                                    Ok(()) => { resolution_error = None; }
+                                    Err(error) => {
+                                        let message = format!("{error:#}");
+                                        if resolution_error.as_ref() != Some(&message) {
+                                            eprintln!("共享分辨率检查失败：{message}");
+                                            resolution_error = Some(message);
+                                        }
+                                    }
+                                }
                             }
                         }
                         #[cfg(not(target_os = "macos"))]
@@ -263,4 +279,56 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+// Keep SIGTERM graceful too, so stopping a background service can restore its
+// window and release the virtual display before Tokio shuts down.
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn connection_check_cannot_create_a_virtual_display() {
+        assert!(
+            Cli::try_parse_from(["remote-cli", "serve", "--check-only", "--virtual-display"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["remote-cli", "serve", "--check-only"]).is_ok());
+    }
+
+    #[test]
+    fn virtual_display_can_be_used_without_mouse_control() {
+        let cli = Cli::try_parse_from([
+            "remote-cli",
+            "serve",
+            "--virtual-display",
+            "--view-only",
+            "--window-id",
+            "123",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Serve {
+                virtual_display: true,
+                view_only: true,
+                window_id: Some(123),
+                ..
+            }
+        ));
+    }
 }
