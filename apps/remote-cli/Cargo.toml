@@ -14,3 +14,15 @@ tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+remote-protocol = { path = "../../crates/protocol" }
+jpeg-decoder.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit.workspace = true
+jpeg-encoder.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+minifb.workspace = true
+
+[dev-dependencies]
+jpeg-encoder.workspace = true

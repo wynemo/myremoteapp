@@ -1,10 +1,31 @@
-//! Bounded control messages. Video payloads will use a separate connection.
+//! Bounded control messages and the initial JPEG preview wire format.
 use serde::{Deserialize, Serialize};
 use std::io::{self, ErrorKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const VERSION: u16 = 1;
 pub const MAX_CONTROL_BYTES: usize = 64 * 1024;
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_FRAME_WIDTH: u32 = 1920;
+pub const MAX_FRAME_HEIGHT: u32 = 1080;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowInfo {
+    pub id: u32,
+    pub app: String,
+    pub title: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreviewFrame {
+    pub width: u32,
+    pub height: u32,
+    pub sequence: u64,
+    pub jpeg: Vec<u8>,
+}
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -15,6 +36,8 @@ pub enum Message {
     Pong { sequence: u64 },
     Error { code: ErrorCode },
     Goodbye,
+    StartPreview,
+    PreviewStarted { window: WindowInfo },
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -22,6 +45,59 @@ pub enum Message {
 pub enum ErrorCode {
     UnsupportedVersion,
     UnexpectedMessage,
+    NoWindowSelected,
+}
+
+pub fn validate_frame_size(width: u32, height: u32) -> io::Result<()> {
+    if width == 0 || height == 0 || width > MAX_FRAME_WIDTH || height > MAX_FRAME_HEIGHT {
+        return Err(invalid_data("invalid preview dimensions"));
+    }
+    Ok(())
+}
+
+/// Preview records: length (0 means capture stopped), width, height, sequence,
+/// then exactly `length` JPEG bytes. All integers are big-endian.
+pub async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &PreviewFrame,
+) -> io::Result<()> {
+    validate_frame_size(frame.width, frame.height)?;
+    if frame.jpeg.is_empty() || frame.jpeg.len() > MAX_FRAME_BYTES {
+        return Err(invalid_data("invalid preview frame length"));
+    }
+    writer.write_u32(frame.jpeg.len() as u32).await?;
+    writer.write_u32(frame.width).await?;
+    writer.write_u32(frame.height).await?;
+    writer.write_u64(frame.sequence).await?;
+    writer.write_all(&frame.jpeg).await?;
+    writer.flush().await
+}
+
+pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Option<PreviewFrame>> {
+    let length = reader.read_u32().await? as usize;
+    if length == 0 {
+        return Ok(None);
+    }
+    if length > MAX_FRAME_BYTES {
+        return Err(invalid_data("preview frame too large"));
+    }
+    let width = reader.read_u32().await?;
+    let height = reader.read_u32().await?;
+    validate_frame_size(width, height)?;
+    let sequence = reader.read_u64().await?;
+    let mut jpeg = vec![0; length];
+    reader.read_exact(&mut jpeg).await?;
+    Ok(Some(PreviewFrame {
+        width,
+        height,
+        sequence,
+        jpeg,
+    }))
+}
+
+pub async fn end_preview<W: AsyncWrite + Unpin>(writer: &mut W) -> io::Result<()> {
+    writer.write_u32(0).await?;
+    writer.flush().await
 }
 
 pub async fn write_message<W: AsyncWrite + Unpin>(
@@ -115,5 +191,51 @@ mod tests {
                 ErrorKind::InvalidData
             );
         }
+    }
+
+    #[tokio::test]
+    async fn frame_and_stop_preserve_boundaries() {
+        let mut wire = Vec::new();
+        let frame = PreviewFrame {
+            width: 320,
+            height: 200,
+            sequence: 9,
+            jpeg: vec![1, 2, 3],
+        };
+        write_frame(&mut wire, &frame).await.unwrap();
+        end_preview(&mut wire).await.unwrap();
+        let mut reader = wire.as_slice();
+        let received = read_frame(&mut reader).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                received.width,
+                received.height,
+                received.sequence,
+                received.jpeg
+            ),
+            (320, 200, 9, vec![1, 2, 3])
+        );
+        assert!(read_frame(&mut reader).await.unwrap().is_none());
+        assert!(reader.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_oversize_frame_and_bad_dimensions() {
+        let length = (MAX_FRAME_BYTES as u32 + 1).to_be_bytes();
+        assert_eq!(
+            read_frame(&mut length.as_slice()).await.unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        let mut invalid = Vec::new();
+        invalid.extend_from_slice(&1u32.to_be_bytes());
+        invalid.extend_from_slice(&(MAX_FRAME_WIDTH + 1).to_be_bytes());
+        invalid.extend_from_slice(&1u32.to_be_bytes());
+        assert_eq!(
+            read_frame(&mut invalid.as_slice())
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
     }
 }
