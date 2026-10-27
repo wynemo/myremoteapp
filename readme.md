@@ -50,6 +50,27 @@ apps/remote-cli      init / serve / probe
 
 推送与 Cargo.toml 版本一致的标签（如 `v0.1.0`）时，两平台构建成功后自动发布 [GitHub Release](https://github.com/wynemo/myremoteapp/releases)。日常分支推送只上传 Artifacts。当前下载包仅含命令行诊断工具和说明文档，尚未提供图形化远程控制客户端；macOS 包未做 Developer ID 签名及公证。
 
+### 下载 Windows 二进制
+
+安装 Python 3.9+ 和 [GitHub CLI](https://cli.github.com/)，先通过 `gh auth login` 登录，也可使用 `GH_TOKEN`。脚本不需要额外的 Python 依赖，可以在 macOS 或 Windows 上运行：
+
+```sh
+python3 scripts/download_windows.py
+```
+
+默认下载 `wynemo/myremoteapp` 的 `main` 分支最近一次成功的 push 构建，校验包的 SHA-256 和 Windows x64 PE 架构，将 `remote-cli.exe` 保存到项目的 `dist/windows/`，不执行二进制。Windows 上可将 `python3` 换成 `python` 或 `py -3`。
+
+```sh
+# 指定输出目录
+python3 scripts/download_windows.py --output ./downloads
+
+# 指定 Actions run，并允许覆盖旧文件
+python3 scripts/download_windows.py --run-id 40464225013 --force
+```
+
+已有文件默认不覆盖。可通过 `--repo OWNER/REPO`、`--branch BRANCH` 修改来源；指定 `--run-id` 时以该运行记录为准。只接受成功完成且 Windows 产物尚未过期的运行；当前产物保留 30 天。
+
+
 ## 在 macOS 本机运行
 
 需要支持 Rust 2024 edition 的 Rust/Cargo。仓库提交 Cargo.lock 固定本次验证的依赖版本。
