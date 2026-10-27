@@ -30,13 +30,20 @@ jobs:
           - runner: windows-2022
             platform: windows-x64
             target: x86_64-pc-windows-msvc
-          - runner: macos-14
+          - runner: macos-26
             platform: macos-arm64
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
+
+      - name: Select Xcode for ScreenCaptureKit bridge
+        if: runner.os == 'macOS'
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_26.3.app/Contents/Developer
+          xcrun swift --version
+          xcrun --sdk macosx --show-sdk-version
 
       - uses: dtolnay/rust-toolchain@stable
         with:
