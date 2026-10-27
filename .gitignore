@@ -4,3 +4,4 @@
 __pycache__/
 connect.json
 identity.json
+/remote-cli.exe

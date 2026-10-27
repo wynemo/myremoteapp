@@ -69,12 +69,12 @@ $env:REMOTEAPP_SOCKS5_PASSWORD = "password"
 需要 Python 3.9+、GitHub CLI 和已登录的 GitHub 身份；也可设置 `GH_TOKEN`。不需要 Python 第三方依赖：
 
 ```sh
-python3 scripts/download_windows.py
-python3 scripts/download_windows.py --output ./downloads
-python3 scripts/download_windows.py --run-id 40464225013 --force
+python3 download_windows.py
+python3 download_windows.py --output ./downloads
+python3 download_windows.py --run-id 40464225013 --force
 ```
 
-Windows 上使用 `python` 或 `py -3` 替代 `python3`。默认读取 `wynemo/myremoteapp` 的 `main` 最近一次成功 push 构建，验证包的 SHA-256 及 PE x64 架构后，将 EXE 写到 `dist/windows/remote-cli.exe`，不会运行它。旧 run（如上例）可能不支持新的连接文件用法，应优先下载最新构建。
+Windows 上使用 `python` 或 `py -3` 替代 `python3`。默认读取 `wynemo/myremoteapp` 的 `main` 最近一次成功 push 构建，验证包的 SHA-256 及 PE x64 架构后，将 EXE 写到 项目根目录的 `remote-cli.exe`，不会运行它。旧 run（如上例）可能不支持新的连接文件用法，应优先下载最新构建。
 
 已有文件默认不覆盖；`--force` 允许替换。`--repo OWNER/REPO`、`--branch BRANCH` 可修改来源；指定 `--run-id` 时使用该运行。产物保留 30 天，过期后不能从 Actions 下载。
 

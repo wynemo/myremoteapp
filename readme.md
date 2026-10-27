@@ -16,7 +16,7 @@ cargo run --release -p remote-cli -- serve
 
 ## Windows 连接检查
 
-从 [Actions](https://github.com/wynemo/myremoteapp/actions/workflows/ci.yml) 下载 Windows 构建，或运行 [下载脚本](scripts/download_windows.py)。解压后，在 PowerShell 中运行（替换为 Mac 的 IP）：
+从 [Actions](https://github.com/wynemo/myremoteapp/actions/workflows/ci.yml) 下载 Windows 构建，或运行 [下载脚本](download_windows.py)。解压后，在 PowerShell 中运行（替换为 Mac 的 IP）：
 
 ```powershell
 .\remote-cli.exe connect --address 192.168.1.10:9443

@@ -17,7 +17,7 @@ import sys
 import tempfile
 import zipfile
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parent
 MAX_EXE_BYTES = 100 * 1024 * 1024
 
 
@@ -50,7 +50,7 @@ def main():
     parser.add_argument("--repo", default="wynemo/myremoteapp", help="GitHub OWNER/REPO")
     parser.add_argument("--branch", default="main", help="branch for the latest successful push build")
     parser.add_argument("--run-id", type=positive_id, help="download from this successful run instead")
-    parser.add_argument("--output", type=Path, default=ROOT / "dist/windows", help="output directory")
+    parser.add_argument("--output", type=Path, default=ROOT, help="output directory (default: repository root)")
     parser.add_argument("--force", action="store_true", help="replace an existing remote-cli.exe")
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repo):
