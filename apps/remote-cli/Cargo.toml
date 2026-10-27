@@ -34,3 +34,6 @@ minifb.workspace = true
 
 [dev-dependencies]
 jpeg-encoder.workspace = true
+
+[build-dependencies]
+cc = "1"

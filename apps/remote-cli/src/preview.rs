@@ -98,6 +98,68 @@ fn native_window(title: &str, frame: &DecodedFrame) -> Result<minifb::Window> {
     Ok(window)
 }
 
+#[cfg(target_os = "macos")]
+mod macos_image {
+    use super::*;
+    use std::ffi::c_void;
+
+    unsafe extern "C" {
+        fn remote_preview_create(window: *mut c_void) -> *mut c_void;
+        fn remote_preview_present(
+            view: *mut c_void,
+            pixels: *const u32,
+            width: usize,
+            height: usize,
+        ) -> bool;
+        fn remote_preview_destroy(view: *mut c_void);
+    }
+    pub struct Renderer {
+        view: *mut c_void,
+        last_frame: Option<(u64, usize, usize)>,
+    }
+    impl Renderer {
+        pub fn new(window: &minifb::Window) -> Result<Self> {
+            // Window creation, rendering and destruction all run on the main thread.
+            let view = unsafe { remote_preview_create(window.get_window_handle()) };
+            ensure!(!view.is_null(), "无法创建 macOS 图像层");
+            Ok(Self {
+                view,
+                last_frame: None,
+            })
+        }
+        pub fn present(&mut self, window: &mut minifb::Window, frame: &DecodedFrame) -> Result<()> {
+            let key = (frame.sequence, frame.width, frame.height);
+            if self.last_frame != Some(key) {
+                ensure!(
+                    frame.pixels.len() == frame.width * frame.height,
+                    "不完整的窗口画面"
+                );
+                ensure!(
+                    unsafe {
+                        remote_preview_present(
+                            self.view,
+                            frame.pixels.as_ptr(),
+                            frame.width,
+                            frame.height,
+                        )
+                    },
+                    "无法绘制 macOS 预览画面"
+                );
+                self.last_frame = Some(key);
+            }
+            // Poll the original native window for input without drawing its
+            // nearest-neighbour Metal surface over the smooth image layer.
+            window.update();
+            Ok(())
+        }
+    }
+    impl Drop for Renderer {
+        fn drop(&mut self) {
+            unsafe { remote_preview_destroy(self.view) };
+        }
+    }
+}
+
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn viewer_active(window: &minifb::Window) -> bool {
     #[cfg(target_os = "macos")]
@@ -139,6 +201,8 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         }
     );
     let mut window = native_window(&title, &first)?;
+    #[cfg(target_os = "macos")]
+    let mut renderer = macos_image::Renderer::new(&window)?;
     let (sender, receiver) = watch::channel(Ok::<_, String>(first));
     let reader = tokio::spawn(async move {
         loop {
@@ -174,6 +238,9 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         println!("收到共享画面：{}×{} 像素。", frame.width, frame.height);
                         displayed_dimensions = Some(dimensions);
                     }
+                    #[cfg(target_os = "macos")]
+                    renderer.present(&mut window, &frame)?;
+                    #[cfg(target_os = "windows")]
                     window.update_with_buffer(&frame.pixels, frame.width, frame.height)?;
                     if let Some(input) = &input {
                         match input.status() {
