@@ -185,6 +185,8 @@ fn raise_window(pid: i32, wanted: Rect) -> Result<()> {
         let running = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
             .context("目标 App 已退出")?;
         running.unhide();
+        let frontmost = string(c"AXFrontmost");
+        AXUIElementSetAttributeValue(app.0, frontmost.0, kCFBooleanTrue);
         running.activateWithOptions(NSApplicationActivationOptions::empty());
         let main = string(c"AXMain");
         AXUIElementSetAttributeValue(matched[0], main.0, kCFBooleanTrue);
