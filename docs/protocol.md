@@ -1,6 +1,6 @@
-# 控制通道 v1
+# 控制通道 v2
 
-本文描述当前实现。视频、输入和代理的格式尚未定稿，不作为已支持能力对外发布。
+本文描述当前实现。JPEG 预览、SOCKS5 TCP 和鼠标控制已实现；H.264、键盘及 WebRTC 尚未实现。
 
 ## 连接与认证
 
@@ -25,8 +25,8 @@
 
 | 方向 | 消息 | 说明 |
 | --- | --- | --- |
-| 客户端 → 服务端 | `{"type":"hello","version":1}` | 第一条应用消息 |
-| 服务端 → 客户端 | `{"type":"welcome","version":1}` | 版本协商成功 |
+| 客户端 → 服务端 | `{"type":"hello","version":2}` | 第一条应用消息 |
+| 服务端 → 客户端 | `{"type":"welcome","version":2}` | 版本协商成功 |
 | 客户端 → 服务端 | `{"type":"ping","sequence":1}` | 往返探测 |
 | 服务端 → 客户端 | `{"type":"pong","sequence":1}` | 原样返回序号 |
 | 客户端 → 服务端 | `{"type":"goodbye"}` | 结束诊断 |
@@ -52,7 +52,7 @@
 
 ## JPEG 窗口预览（已实现）
 
-为保留已有连接检查兼容性，Hello/Welcome 版本仍为 1。原有 ping/pong/Goodbye 不变。客户端完成握手后发送 `{"type":"start_preview"}`，服务端返回 `preview_started` 消息，携带 `window`（id、app、title、width、height）。服务未选择窗口时返回 `no_window_selected` 错误并结束会话。旧服务不支持新消息，客户端会提示更新 Mac 端。
+当前 Hello/Welcome 版本为 2，两端需要同时更新。ping/pong/Goodbye 格式不变。客户端完成握手后发送 `{"type":"start_preview"}`，服务端返回 `preview_started` 消息，携带 `window`（id、app、title、width、height）。服务未选择窗口时返回 `no_window_selected` 错误并结束会话。旧服务不支持新消息，客户端会提示更新 Mac 端。
 
 `preview_started` 之后，这条连接只传预览记录，不再交织 JSON 控制消息：
 
@@ -63,3 +63,18 @@
 整数均为大端。长度 0 表示采集结束，此时不包含后续字段。每帧上限 8 MiB，尺寸必须在 1～1920 × 1～1080 范围内，客户端在解码前校验 JPEG 内部尺寸与记录头一致，并限制解码内存。当前实际捕获最大 1280×720、10 FPS、JPEG 质量 75。
 
 发送端和接收端均只保留最新帧，静止窗口每秒重发最后一帧以保活；每次读写有 10 秒期限。没有首帧、锁屏、窗口关闭或断线时结束预览，不自动改为采集桌面。当前帧通道复用已认证的 TLS/SOCKS5 TCP 连接；后续独立视频通道和 H.264 约束不属于已实现能力。
+
+
+## 独立鼠标控制连接（已实现）
+
+控制连接独立于 JPEG 视频连接，复用相同 TLS 双向设备认证、目标地址及 SOCKS5 路由。客户端先完成 Hello/Welcome v2，再发送 `start_control`（window_id 必须匹配当前共享窗口）。服务端返回 `control_ready`；仅观看服务返回 `control_unavailable`，已有控制者返回 `control_busy`。
+
+后续使用有界 JSON 控制消息：
+
+- `mouse`：event 包含 frame_sequence（显示帧序号）、x/y（0～65535 的归一化画面坐标）以及 kind；kind.action 为 move、button（button=left/right/middle，down=bool）或 scroll（dx/dy 为有符号整数）。
+- `release_input`：释放所有已按下的鼠标按钮，不要求帧序号有效。
+- `input_error`：服务端拒绝某次输入并释放按钮，携带 message；窗口可继续显示，客户端把原因展示到终端和窗口标题。
+- `ping` / `pong`：每 2 秒心跳，服务端读超时 10 秒。
+- `goodbye`：结束控制连接，释放控制权和按钮。
+
+视频帧序号在当前 capture stream 内唯一。Mac 保存最近 128 帧的坐标信息，校验当前窗口尺寸后映射；过期序号、已关闭窗口、锁屏或权限撤销均不继续注入。按钮松开/全部释放不受过期帧限制。控制会话通过 RAII 在 EOF、错误、超时和任务取消时释放按钮及独占控制权。

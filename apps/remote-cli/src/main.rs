@@ -1,5 +1,9 @@
 #[cfg(target_os = "macos")]
+mod input_macos;
+#[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "windows", test))]
+mod mouse;
 mod pairing;
 mod preview;
 
@@ -10,7 +14,7 @@ use std::{path::PathBuf, sync::Arc};
 use tokio::{net::TcpListener, sync::Semaphore};
 
 #[derive(Parser)]
-#[command(about = "MyRemoteApp 单窗口预览（键鼠控制尚未实现）")]
+#[command(about = "MyRemoteApp 单窗口共享与鼠标控制（键盘尚未实现）")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -35,6 +39,9 @@ enum Command {
         /// 只启动连接检查服务，不请求屏幕权限、不采集画面。
         #[arg(long)]
         check_only: bool,
+        /// 仅共享画面，不启用鼠标控制、不请求辅助功能权限。
+        #[arg(long, conflicts_with = "check_only")]
+        view_only: bool,
     },
     /// 通过直连或 SOCKS5 打开共享窗口预览。
     #[command(alias = "probe")]
@@ -57,6 +64,9 @@ enum Command {
         /// 收取一帧并保存为 JPEG，不打开窗口，不覆盖已有文件。
         #[arg(long)]
         save_frame: Option<PathBuf>,
+        /// 只观看画面，不建立鼠标控制连接。
+        #[arg(long, conflicts_with_all = ["save_frame", "check_only"])]
+        view_only: bool,
     },
 }
 
@@ -77,6 +87,7 @@ async fn main() -> Result<()> {
             socks5_password,
             check_only,
             save_frame,
+            view_only,
         } => {
             let connection = pairing::ConnectionFile::load(&connection_file)
                 .with_context(|| format!("无法读取连接文件 {}", connection_file.display()))?;
@@ -94,7 +105,7 @@ async fn main() -> Result<()> {
                 credentials: socks5_user.zip(socks5_password),
             });
             let mut stream =
-                remote_transport::connect_via(&address, config, proxy.as_ref()).await?;
+                remote_transport::connect_via(&address, config.clone(), proxy.as_ref()).await?;
             if check_only {
                 let rtt = remote_session::probe(&mut stream).await?;
                 println!(
@@ -105,7 +116,12 @@ async fn main() -> Result<()> {
             } else if let Some(path) = save_frame {
                 preview::save_frame(&mut stream, &path).await?;
             } else {
-                preview::view(stream).await?;
+                let control = if view_only {
+                    None
+                } else {
+                    Some(remote_transport::connect_via(&address, config, proxy.as_ref()).await?)
+                };
+                preview::view(stream, control).await?;
             }
         }
         Command::Serve {
@@ -114,19 +130,20 @@ async fn main() -> Result<()> {
             reset_pairing,
             window_id,
             check_only,
+            view_only,
         } => {
             let listener = TcpListener::bind(&listen).await?;
             #[cfg(target_os = "macos")]
             let capture = if check_only {
                 None
             } else {
-                Some(macos::start(window_id)?)
+                Some(macos::start(window_id, view_only)?)
             };
             #[cfg(target_os = "macos")]
             let preview = capture.as_ref().map(|capture| capture.source.clone());
             #[cfg(not(target_os = "macos"))]
             let preview = {
-                let _ = window_id;
+                let _ = (window_id, view_only);
                 anyhow::ensure!(
                     check_only,
                     "窗口采集服务只能在 Mac 端启动；连接检查可用 --check-only"

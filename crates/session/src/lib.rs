@@ -1,8 +1,8 @@
-//! A diagnostic session; no capture or input capabilities are advertised yet.
+//! Authenticated diagnostic, video, and mouse-control sessions.
 use anyhow::{Result, bail};
 use remote_protocol::{
-    ErrorCode, Message, PreviewFrame, VERSION, WindowInfo, end_preview, read_message, write_frame,
-    write_message,
+    ErrorCode, Message, MouseEvent, PreviewFrame, VERSION, WindowInfo, end_preview, read_message,
+    write_frame, write_message,
 };
 use std::{
     sync::Arc,
@@ -26,6 +26,17 @@ pub enum CaptureEvent {
 pub struct PreviewSource {
     pub window: WindowInfo,
     pub frames: watch::Receiver<Option<CaptureEvent>>,
+    pub input: Option<Arc<dyn InputController>>,
+}
+
+pub trait InputController: Send + Sync {
+    fn acquire(&self) -> Result<Box<dyn InputSession>>;
+}
+
+/// Implementors release all held buttons in Drop, including task cancellation.
+pub trait InputSession: Send {
+    fn apply(&mut self, event: MouseEvent) -> Result<()>;
+    fn release_all(&mut self);
 }
 
 pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> Result<()> {
@@ -79,6 +90,64 @@ pub async fn serve_with_preview<S: AsyncRead + AsyncWrite + Unpin>(
                 };
                 return stream_preview(stream, source).await;
             }
+            Message::StartControl { window_id } => {
+                let Some(source) = preview.filter(|source| source.window.id == window_id) else {
+                    send(
+                        stream,
+                        &Message::Error {
+                            code: ErrorCode::NoWindowSelected,
+                        },
+                    )
+                    .await?;
+                    bail!("共享窗口已变更，请重新连接");
+                };
+                let Some(controller) = source.input else {
+                    send(
+                        stream,
+                        &Message::Error {
+                            code: ErrorCode::ControlUnavailable,
+                        },
+                    )
+                    .await?;
+                    bail!("当前共享未启用鼠标控制");
+                };
+                let mut input = match controller.acquire() {
+                    Ok(input) => input,
+                    Err(error) => {
+                        send(
+                            stream,
+                            &Message::Error {
+                                code: ErrorCode::ControlBusy,
+                            },
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                };
+                send(stream, &Message::ControlReady).await?;
+                loop {
+                    match timeout(IO_TIMEOUT, read_message(stream)).await?? {
+                        Message::Mouse { event } => {
+                            if let Err(error) = input.apply(event) {
+                                input.release_all();
+                                send(
+                                    stream,
+                                    &Message::InputError {
+                                        message: error.to_string(),
+                                    },
+                                )
+                                .await?;
+                            }
+                        }
+                        Message::ReleaseInput => input.release_all(),
+                        Message::Ping { sequence } => {
+                            send(stream, &Message::Pong { sequence }).await?
+                        }
+                        Message::Goodbye => return Ok(()),
+                        _ => bail!("unexpected control message"),
+                    }
+                }
+            }
             _ => {
                 send(
                     stream,
@@ -90,6 +159,28 @@ pub async fn serve_with_preview<S: AsyncRead + AsyncWrite + Unpin>(
                 bail!("unexpected session message");
             }
         }
+    }
+}
+
+pub async fn start_control<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    window_id: u32,
+) -> Result<()> {
+    send(stream, &Message::Hello { version: VERSION }).await?;
+    if timeout(IO_TIMEOUT, read_message(stream)).await?? != (Message::Welcome { version: VERSION })
+    {
+        bail!("鼠标控制协议不兼容，请更新两端程序");
+    }
+    send(stream, &Message::StartControl { window_id }).await?;
+    match timeout(IO_TIMEOUT, read_message(stream)).await?? {
+        Message::ControlReady => Ok(()),
+        Message::Error {
+            code: ErrorCode::ControlBusy,
+        } => bail!("已有客户端正在控制该窗口；可加 --view-only 仅观看"),
+        Message::Error {
+            code: ErrorCode::ControlUnavailable,
+        } => bail!("Mac 未启用鼠标控制；请检查辅助功能权限，或加 --view-only 仅观看"),
+        _ => bail!("无法开启鼠标控制，请检查 Mac 服务日志"),
     }
 }
 
@@ -236,6 +327,7 @@ mod tests {
                 height: 4,
             },
             frames,
+            input: None,
         };
         let (mut client, mut server) = tokio::io::duplex(1024);
         let host = tokio::spawn(async move { serve_with_preview(&mut server, Some(source)).await });
@@ -263,6 +355,109 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(1024);
         let host = tokio::spawn(async move { serve(&mut server).await });
         assert!(start_preview(&mut client).await.is_err());
+        assert!(host.await.unwrap().is_err());
+    }
+
+    struct TestController(Arc<std::sync::atomic::AtomicBool>);
+    struct TestInput(Arc<std::sync::atomic::AtomicBool>);
+    impl InputController for TestController {
+        fn acquire(&self) -> Result<Box<dyn InputSession>> {
+            Ok(Box::new(TestInput(self.0.clone())))
+        }
+    }
+    impl InputSession for TestInput {
+        fn apply(&mut self, event: MouseEvent) -> Result<()> {
+            use remote_protocol::{MouseAction, MouseButton};
+            if let MouseAction::Button {
+                button: MouseButton::Left,
+                down,
+            } = event.kind
+            {
+                self.0.store(down, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        fn release_all(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    impl Drop for TestInput {
+        fn drop(&mut self) {
+            self.release_all();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_control_session_releases_pressed_button() {
+        use remote_protocol::{MouseAction, MouseButton};
+        let pressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_sender, frames) = watch::channel(None);
+        let source = PreviewSource {
+            window: WindowInfo {
+                id: 5,
+                app: "Test".into(),
+                title: "Test".into(),
+                width: 4,
+                height: 4,
+            },
+            frames,
+            input: Some(Arc::new(TestController(pressed.clone()))),
+        };
+        let (mut client, mut server) = tokio::io::duplex(2048);
+        let host = tokio::spawn(async move { serve_with_preview(&mut server, Some(source)).await });
+        start_control(&mut client, 5).await.unwrap();
+        write_message(
+            &mut client,
+            &Message::Mouse {
+                event: MouseEvent {
+                    frame_sequence: 0,
+                    x: 32768,
+                    y: 32768,
+                    kind: MouseAction::Button {
+                        button: MouseButton::Left,
+                        down: true,
+                    },
+                },
+            },
+        )
+        .await
+        .unwrap();
+        write_message(&mut client, &Message::Ping { sequence: 9 })
+            .await
+            .unwrap();
+        assert_eq!(
+            read_message(&mut client).await.unwrap(),
+            Message::Pong { sequence: 9 }
+        );
+        assert!(pressed.load(std::sync::atomic::Ordering::SeqCst));
+        host.abort();
+        let _ = host.await;
+        assert!(!pressed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn control_is_unavailable_in_view_only_session() {
+        let (_sender, frames) = watch::channel(None);
+        let source = PreviewSource {
+            window: WindowInfo {
+                id: 5,
+                app: "Test".into(),
+                title: "Test".into(),
+                width: 4,
+                height: 4,
+            },
+            frames,
+            input: None,
+        };
+        let (mut client, mut server) = tokio::io::duplex(2048);
+        let host = tokio::spawn(async move { serve_with_preview(&mut server, Some(source)).await });
+        assert!(
+            start_control(&mut client, 5)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("辅助功能")
+        );
         assert!(host.await.unwrap().is_err());
     }
 }

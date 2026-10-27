@@ -12,6 +12,7 @@ pub struct DecodedFrame {
     pub width: usize,
     pub height: usize,
     pub pixels: Vec<u32>,
+    pub sequence: u64,
 }
 
 pub fn decode(frame: &PreviewFrame) -> Result<DecodedFrame> {
@@ -39,6 +40,7 @@ pub fn decode(frame: &PreviewFrame) -> Result<DecodedFrame> {
         width: frame.width as usize,
         height: frame.height as usize,
         pixels,
+        sequence: frame.sequence,
     })
 }
 
@@ -67,12 +69,13 @@ pub async fn save_frame<S: AsyncRead + AsyncWrite + Unpin>(
         .open(path)?
         .write_all(&frame.jpeg)?;
     println!(
-        "已收到 {} — {} 的画面，保存到 {}（{}×{}）",
+        "已收到 {} — {} 的画面，保存到 {}（{}×{}，帧 {}）",
         window.app,
         window.title,
         path.display(),
         frame.width,
-        frame.height
+        frame.height,
+        decoded.sequence
     );
     Ok(())
 }
@@ -96,16 +99,32 @@ fn native_window(title: &str, frame: &DecodedFrame) -> Result<minifb::Window> {
 }
 
 #[cfg(target_os = "windows")]
-pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(mut stream: S) -> Result<()> {
-    use minifb::Key;
+pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    mut stream: S,
+    control: Option<S>,
+) -> Result<()> {
+    use crate::mouse::{ControlClient, MouseSample, MouseTracker, Status};
+    use minifb::{Key, MouseButton, MouseMode};
     use std::{sync::Arc, time::Duration};
     use tokio::sync::watch;
     let shared = remote_session::start_preview(&mut stream).await?;
     let first = Arc::new(decode(&next_frame(&mut stream).await?)?);
-    let mut window = native_window(
-        &format!("{} — {}（仅观看，Esc 关闭）", shared.app, shared.title),
-        &first,
-    )?;
+    let input = if let Some(control) = control {
+        Some(ControlClient::start(control, shared.id).await?)
+    } else {
+        None
+    };
+    let title = format!(
+        "{} — {}（{}，Esc 关闭）",
+        shared.app,
+        shared.title,
+        if input.is_some() {
+            "鼠标控制；键盘暂不支持"
+        } else {
+            "仅观看"
+        }
+    );
+    let mut window = native_window(&title, &first)?;
     let (sender, receiver) = watch::channel(Ok::<_, String>(first));
     let reader = tokio::spawn(async move {
         loop {
@@ -127,11 +146,47 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(mut stream
     });
     // The native window stays on the main thread; Tokio workers receive and
     // decode independently. Both stages retain only the most recent frame.
+    let mut mouse = MouseTracker::default();
+    let mut notice = None;
     let result = (|| -> Result<()> {
         while window.is_open() && !window.is_key_down(Key::Escape) {
             let current = receiver.borrow().clone();
             match current {
-                Ok(frame) => window.update_with_buffer(&frame.pixels, frame.width, frame.height)?,
+                Ok(frame) => {
+                    window.update_with_buffer(&frame.pixels, frame.width, frame.height)?;
+                    if let Some(input) = &input {
+                        match input.status() {
+                            Status::Failed(error) => bail!("{error}"),
+                            Status::Notice(error) => {
+                                if notice.as_ref() != Some(&error) {
+                                    eprintln!("{error}");
+                                    window.set_title(&format!("{title} — {error}"));
+                                    notice = Some(error);
+                                }
+                            }
+                            Status::Ready => {
+                                if notice.take().is_some() {
+                                    window.set_title(&title);
+                                }
+                            }
+                        }
+                        for event in mouse.update(MouseSample {
+                            position: window.get_unscaled_mouse_pos(MouseMode::Discard),
+                            window: window.get_size(),
+                            frame: (frame.width, frame.height),
+                            sequence: frame.sequence,
+                            buttons: [
+                                window.get_mouse_down(MouseButton::Left),
+                                window.get_mouse_down(MouseButton::Right),
+                                window.get_mouse_down(MouseButton::Middle),
+                            ],
+                            scroll: window.get_scroll_wheel(),
+                            active: window.is_active(),
+                        }) {
+                            input.send(event)?;
+                        }
+                    }
+                }
                 Err(error) => bail!("{error}"),
             }
             std::thread::sleep(Duration::from_millis(1));
@@ -139,11 +194,17 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(mut stream
         Ok(())
     })();
     reader.abort();
+    if let Some(input) = input {
+        input.finish().await;
+    }
     result
 }
 
 #[cfg(not(target_os = "windows"))]
-pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(_stream: S) -> Result<()> {
+pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    _stream: S,
+    _control: Option<S>,
+) -> Result<()> {
     bail!(
         "图形预览目前在 Windows 提供；Mac 可用 --save-frame preview.jpg 验证采集，或用 --check-only 检查连接"
     )

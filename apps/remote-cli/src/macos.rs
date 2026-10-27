@@ -39,7 +39,7 @@ unsafe extern "C" {
     fn CFRelease(value: *const std::ffi::c_void);
 }
 
-fn is_locked() -> bool {
+pub(crate) fn is_locked() -> bool {
     // The session dictionary exposes the desktop lock flag as a CFBoolean.
     // Both objects created with Copy/Create are released on every branch.
     unsafe {
@@ -136,15 +136,19 @@ pub fn list_windows() -> Result<()> {
 pub struct CaptureSession {
     stream: SCStream,
     pub source: PreviewSource,
+    input: Option<Arc<super::input_macos::MacInput>>,
 }
 
 impl Drop for CaptureSession {
     fn drop(&mut self) {
+        if let Some(input) = &self.input {
+            input.stop();
+        }
         let _ = self.stream.stop_capture();
     }
 }
 
-pub fn start(window_id: Option<u32>) -> Result<CaptureSession> {
+pub fn start(window_id: Option<u32>, view_only: bool) -> Result<CaptureSession> {
     let (content, windows) = available()?;
     let selected = if let Some(id) = window_id {
         windows
@@ -179,6 +183,16 @@ pub fn start(window_id: Option<u32>) -> Result<CaptureSession> {
         .iter()
         .find(|window| window.window_id() == selected.id)
         .context("选中的窗口已关闭，请重新选择")?;
+    let input = if view_only {
+        None
+    } else {
+        super::input_macos::require_permission()?;
+        let pid = window
+            .owning_application()
+            .context("目标 App 已退出")?
+            .process_id();
+        Some(super::input_macos::MacInput::new(selected.id, pid))
+    };
     let ratio = (1280.0 / selected.width as f64)
         .min(720.0 / selected.height as f64)
         .min(1.0);
@@ -196,7 +210,11 @@ pub fn start(window_id: Option<u32>) -> Result<CaptureSession> {
         .with_queue_depth(3);
     let (sender, receiver) = watch::channel(None);
     let errors = sender.clone();
+    let stopped_input = input.clone();
     let delegate = StreamCallbacks::new().on_error(move |error| {
+        if let Some(input) = &stopped_input {
+            input.stop();
+        }
         eprintln!("窗口采集停止：{error}");
         errors.send_replace(Some(CaptureEvent::Stopped(error.to_string())));
     });
@@ -207,6 +225,7 @@ pub fn start(window_id: Option<u32>) -> Result<CaptureSession> {
             busy: Mutex::new(()),
             sequence: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
+            input: input.clone(),
         },
         SCStreamOutputType::Screen,
     )?;
@@ -214,11 +233,12 @@ pub fn start(window_id: Option<u32>) -> Result<CaptureSession> {
         .start_capture()
         .context("无法采集指定窗口，请检查屏幕录制权限或重新选择窗口")?;
     println!(
-        "正在共享：{} — {}（{}×{}，最多 10 FPS，预览模式）",
+        "正在共享：{} — {}（{}×{}，最多 10 FPS）",
         selected.app, selected.title, width, height
     );
     Ok(CaptureSession {
         stream,
+        input: input.clone(),
         source: PreviewSource {
             window: WindowInfo {
                 width,
@@ -226,6 +246,10 @@ pub fn start(window_id: Option<u32>) -> Result<CaptureSession> {
                 ..selected
             },
             frames: receiver,
+            input: input.map(|input| {
+                Arc::new(super::input_macos::Controller(input))
+                    as Arc<dyn remote_session::InputController>
+            }),
         },
     })
 }
@@ -235,6 +259,7 @@ struct Handler {
     busy: Mutex<()>,
     sequence: AtomicU64,
     stopped: AtomicBool,
+    input: Option<Arc<super::input_macos::MacInput>>,
 }
 
 impl SCStreamOutputTrait for Handler {
@@ -244,6 +269,9 @@ impl SCStreamOutputTrait for Handler {
         }
         if is_locked() {
             if !self.stopped.swap(true, Ordering::Relaxed) {
+                if let Some(input) = &self.input {
+                    input.stop();
+                }
                 let reason = "Mac 已锁屏，请解锁后重新启动共享";
                 eprintln!("{reason}");
                 self.sender
@@ -306,6 +334,26 @@ impl Handler {
             jpeg_encoder::ColorType::Bgra,
         )?;
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        if let Some(input) = &self.input
+            && let Some(content) = sample.content_rect()
+        {
+            let scale = sample.scale_factor().unwrap_or(1.0);
+            input.record(
+                sequence,
+                width as u32,
+                height as u32,
+                super::input_macos::Rect {
+                    origin: super::input_macos::Point {
+                        x: content.origin.x * scale,
+                        y: content.origin.y * scale,
+                    },
+                    size: super::input_macos::Size {
+                        width: content.size.width * scale,
+                        height: content.size.height * scale,
+                    },
+                },
+            );
+        }
         if sequence == 0 {
             println!("已取得首帧，Windows 可以连接观看。");
         }

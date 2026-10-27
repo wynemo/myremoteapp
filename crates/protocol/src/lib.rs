@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, ErrorKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 pub const MAX_CONTROL_BYTES: usize = 64 * 1024;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_FRAME_WIDTH: u32 = 1920;
@@ -27,6 +27,31 @@ pub struct PreviewFrame {
     pub jpeg: Vec<u8>,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseButton {
+    Left,
+    Right,
+    Middle,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MouseAction {
+    Move,
+    Button { button: MouseButton, down: bool },
+    Scroll { dx: i16, dy: i16 },
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MouseEvent {
+    pub frame_sequence: u64,
+    pub x: u16,
+    pub y: u16,
+    pub kind: MouseAction,
+}
+
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Message {
@@ -38,6 +63,11 @@ pub enum Message {
     Goodbye,
     StartPreview,
     PreviewStarted { window: WindowInfo },
+    StartControl { window_id: u32 },
+    ControlReady,
+    Mouse { event: MouseEvent },
+    ReleaseInput,
+    InputError { message: String },
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -46,6 +76,8 @@ pub enum ErrorCode {
     UnsupportedVersion,
     UnexpectedMessage,
     NoWindowSelected,
+    ControlUnavailable,
+    ControlBusy,
 }
 
 pub fn validate_frame_size(width: u32, height: u32) -> io::Result<()> {
