@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "macos", test))]
+mod capture_readiness;
 #[cfg(target_os = "macos")]
 mod input_macos;
 #[cfg(target_os = "macos")]
@@ -211,11 +213,16 @@ async fn main() -> Result<()> {
                 );
                 None
             };
-            let ready = Arc::new(AtomicBool::new(preview.is_some()));
+            let ready = Arc::new(AtomicBool::new(false));
             #[cfg(target_os = "macos")]
-            let unlock: Option<Arc<dyn remote_session::UnlockHost>> = Some(Arc::new(
-                unlock_macos::NativeUnlockHost::new(!check_only && !view_only, ready.clone()),
-            ));
+            let recovery_requested = Arc::new(AtomicBool::new(false));
+            #[cfg(target_os = "macos")]
+            let unlock: Option<Arc<dyn remote_session::UnlockHost>> =
+                Some(Arc::new(unlock_macos::NativeUnlockHost::new(
+                    !check_only && !view_only,
+                    ready.clone(),
+                    recovery_requested.clone(),
+                )));
             #[cfg(not(target_os = "macos"))]
             let unlock: Option<Arc<dyn remote_session::UnlockHost>> = None;
             let state = pairing::load_or_create(&state_dir, reset_pairing)?;
@@ -241,6 +248,8 @@ async fn main() -> Result<()> {
             tokio::pin!(shutdown);
             #[cfg(target_os = "macos")]
             let mut resolution_error: Option<String> = None;
+            #[cfg(target_os = "macos")]
+            let mut capture_readiness = capture_readiness::CaptureReadiness::default();
             loop {
                 let (tcp, address) = tokio::select! {
                     result = listener.accept() => result?,
@@ -250,18 +259,28 @@ async fn main() -> Result<()> {
                         if let Some(current)=&capture {
                             if macos::is_locked() {
                                 ready.store(false,Ordering::Release);
+                                recovery_requested.store(true,Ordering::Release);
+                                capture_readiness.reset();
                                 current.pause_for_lock();
-                            } else if current.paused_for_lock() || (!ready.load(Ordering::Acquire) && matches!(&*current.source.frames.borrow(),Some(remote_session::CaptureEvent::Stopped(_)))) {
+                            } else if recovery_requested.swap(false,Ordering::AcqRel) || current.paused_for_lock() || matches!(&*current.source.frames.borrow(),Some(remote_session::CaptureEvent::Stopped(_))) {
+                                ready.store(false,Ordering::Release);
+                                capture_readiness.reset();
                                 match current.resume(view_only) {
                                     Ok(resumed)=>{
                                         preview=Some(resumed.source.clone());capture=Some(resumed);
-                                        ready.store(true,Ordering::Release);
-                                        println!("Mac 已解锁，原共享窗口已恢复。");
+                                        println!("Mac 已解锁，正在等待原共享窗口画面恢复。");
                                     }
-                                    Err(_)=>{ ready.store(false,Ordering::Release); }
+                                    Err(_)=>{ recovery_requested.store(true,Ordering::Release); }
                                 }
-                            } else if matches!(&*current.source.frames.borrow(),Some(remote_session::CaptureEvent::Frame(_))) {
-                                ready.store(true,Ordering::Release);
+                            } else {
+                                let has_frame=matches!(&*current.source.frames.borrow(),Some(remote_session::CaptureEvent::Frame(_)));
+                                let healthy=has_frame && !current.paused_for_lock() && !macos::is_locked();
+                                let recovered=capture_readiness.observe(healthy,std::time::Instant::now());
+                                let was_ready=ready.swap(recovered,Ordering::AcqRel);
+                                if recovered && !was_ready {
+                                    println!("原共享窗口画面已恢复，可以连接。");
+                                }
+                                if has_frame {
                                 match current.refresh_resolution() {
                                     Ok(()) => { resolution_error = None; }
                                     Err(error) => {
@@ -271,6 +290,7 @@ async fn main() -> Result<()> {
                                             resolution_error = Some(message);
                                         }
                                     }
+                                }
                                 }
                             }
                         }

@@ -602,6 +602,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unlock_success_waits_for_recovered_capture_without_resubmitting_password() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct RecoveringHost {
+            ready: AtomicBool,
+            calls: AtomicUsize,
+            submitted: tokio::sync::Notify,
+        }
+        impl UnlockHost for RecoveringHost {
+            fn status(&self) -> (bool, bool) {
+                (false, true)
+            }
+            fn capture_ready(&self) -> bool {
+                self.ready.load(Ordering::Acquire)
+            }
+            fn unlock(&self, _: &[u8], _: &AtomicBool) -> UnlockOutcome {
+                self.calls.fetch_add(1, Ordering::AcqRel);
+                self.submitted.notify_one();
+                UnlockOutcome::Unlocked
+            }
+        }
+        let host = Arc::new(RecoveringHost {
+            ready: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+            submitted: tokio::sync::Notify::new(),
+        });
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        let backend = host.clone();
+        let server_task =
+            tokio::spawn(async move { serve_with_host(&mut server, None, Some(backend)).await });
+        let client_task = tokio::spawn(async move {
+            unlock_remote(
+                &mut client,
+                zeroize::Zeroizing::new("test-only-secret".into()),
+            )
+            .await
+        });
+        timeout(IO_TIMEOUT, host.submitted.notified())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !client_task.is_finished(),
+            "reported success before capture recovery"
+        );
+        host.ready.store(true, Ordering::Release);
+        timeout(IO_TIMEOUT, client_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        server_task.await.unwrap().unwrap();
+        assert_eq!(host.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
     async fn status_and_one_shot_password_unlock_use_separate_sessions() {
         let host = Arc::new(TestUnlock {
             locked: std::sync::atomic::AtomicBool::new(true),

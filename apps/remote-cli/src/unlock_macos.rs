@@ -522,14 +522,16 @@ fn submit(password: &[u8], cancelled: &AtomicBool) -> Result<UnlockOutcome> {
 pub struct NativeUnlockHost {
     enabled: bool,
     ready: Arc<AtomicBool>,
+    recovery_requested: Arc<AtomicBool>,
     busy: Mutex<()>,
     attempts: Mutex<VecDeque<Instant>>,
 }
 impl NativeUnlockHost {
-    pub fn new(enabled: bool, ready: Arc<AtomicBool>) -> Self {
+    pub fn new(enabled: bool, ready: Arc<AtomicBool>, recovery_requested: Arc<AtomicBool>) -> Self {
         Self {
             enabled,
             ready,
+            recovery_requested,
             busy: Mutex::new(()),
             attempts: Mutex::new(VecDeque::new()),
         }
@@ -540,6 +542,7 @@ impl UnlockHost for NativeUnlockHost {
         let locked = crate::macos::is_locked();
         if locked {
             self.ready.store(false, Ordering::Release);
+            self.recovery_requested.store(true, Ordering::Release);
         }
         (
             locked,
@@ -548,6 +551,8 @@ impl UnlockHost for NativeUnlockHost {
     }
     fn capture_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
+            && !self.recovery_requested.load(Ordering::Acquire)
+            && !crate::macos::is_locked()
     }
     fn unlock(&self, password: &[u8], cancelled: &AtomicBool) -> UnlockOutcome {
         if cancelled.load(Ordering::Acquire)
@@ -567,6 +572,7 @@ impl UnlockHost for NativeUnlockHost {
             _ => {}
         }
         self.ready.store(false, Ordering::Release);
+        self.recovery_requested.store(true, Ordering::Release);
         let Ok(_guard) = self.busy.try_lock() else {
             return UnlockOutcome::Busy;
         };
