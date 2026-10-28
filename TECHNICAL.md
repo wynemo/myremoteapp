@@ -21,7 +21,7 @@ Windows 的 `serve` 默认共享整个虚拟桌面，`serve --desktop` 可显式
 
 服务运行在当前交互用户的桌面，不是 Windows 后台系统服务。启动要求桌面已解锁；锁屏或切换至 UAC 安全桌面时停止画面和控制，不实现 Windows 远程解锁。客户端不会索取 Windows 登录密码。无需人工生成或交换证书，复制服务端导出的 `.local/host/connect.json` 即可。
 
-验证边界：按用户要求，本次不编译 Windows 产物、不触发 Windows CI，也不安装 Windows SDK 或交叉编译工具。本机只验证 macOS 和共享模块；Windows 原生 API 路径仍待 Windows 构建与实机验收，不能以本机检查代替。
+验证边界：本机只验证 macOS 和共享模块，不安装 Windows SDK 或交叉编译工具。Windows 构建、测试及 Clippy 由 GitHub Actions 的 Windows runner 原生执行，使用 Release 模式和 `--locked`。真实 Windows 桌面的采集、多屏显示和鼠标操作仍需实机验收，不能以 CI 通过代替。
 
 API 依据：[StretchBlt](https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-stretchblt)、[SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput)、[MOUSEINPUT 虚拟桌面坐标](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-mouseinput)。
 
