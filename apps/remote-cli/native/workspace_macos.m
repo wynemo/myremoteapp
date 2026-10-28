@@ -2,6 +2,7 @@
 #import <ApplicationServices/ApplicationServices.h>
 #include <stdbool.h>
 #include <unistd.h>
+#include <stdio.h>
 
 // Runtime-checked CoreGraphics SPI. No changes to physical display modes.
 @interface NSObject (RemoteVirtualDisplayAPI)
@@ -162,19 +163,40 @@ void *remote_workspace_create(uint32_t windowID, int32_t pid, int32_t *error) {
         CGSize size = CGSizeMake(round(workspace->original.size.width * fit), round(workspace->original.size.height * fit));
         CGPoint point = CGPointMake(screen.origin.x + 80, screen.origin.y + 60);
         workspace->moved = YES;
-        if (!setPosition(workspace->target, point) || !setSize(workspace->target, size) || !setPosition(workspace->target, point)) {
-            *error = 7; return NULL;
-        }
+        // Display registration and AX setters are asynchronous. A size setter
+        // may also be unsupported (fixed-size apps); it must not short-circuit
+        // the second move or turn a successfully moved window into a failure.
         bool placed = false;
+        bool moveAccepted = false, sizeAccepted = false;
+        CGRect current = workspace->original;
         for (int i = 0; i < 60; i++) {
-            CGRect current;
-            if (windowBounds(windowID, pid, &current) && CGRectContainsRect(screen, current) &&
-                current.size.width >= size.width * 0.8 && current.size.height >= size.height * 0.8) {
-                placed = true; break;
+            if (i % 10 == 0) {
+                moveAccepted = setPosition(workspace->target, point);
+                sizeAccepted = setSize(workspace->target, size);
+                setPosition(workspace->target, point);
+            }
+            bool found = windowBounds(windowID, pid, &current);
+            if (found && CGRectContainsRect(screen, current) &&
+                current.size.width > 0 && current.size.height > 0) {
+                placed = true;
+                if (current.size.width >= size.width * 0.8 && current.size.height >= size.height * 0.8)
+                    break;
+            } else {
+                placed = false;
             }
             usleep(50000);
         }
-        if (!placed) { *error = 7; return NULL; }
+        if (!placed) {
+            fprintf(stderr, "虚拟屏窗口移动失败：位置设置=%s，大小设置=%s；窗口=(%.0f,%.0f %.0f×%.0f)，虚拟屏=(%.0f,%.0f %.0f×%.0f)\n",
+                    moveAccepted ? "接受" : "拒绝", sizeAccepted ? "接受" : "拒绝",
+                    current.origin.x, current.origin.y, current.size.width, current.size.height,
+                    screen.origin.x, screen.origin.y, screen.size.width, screen.size.height);
+            *error = 7; return NULL;
+        }
+        if (current.size.width < size.width * 0.8 || current.size.height < size.height * 0.8) {
+            fprintf(stderr, "目标 App 限制窗口大小：请求 %.0f×%.0f，实际 %.0f×%.0f 点；继续使用虚拟屏 HiDPI 采集，但未达到期望放大尺寸。\n",
+                    size.width, size.height, current.size.width, current.size.height);
+        }
         return (__bridge_retained void *)workspace;
     } @catch (NSException *exception) {
         *error = 4;
