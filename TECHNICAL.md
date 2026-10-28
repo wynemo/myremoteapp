@@ -4,12 +4,26 @@
 
 - macOS / Windows 共用连接检查 CLI，支持 TCP 直连和 SOCKS5 CONNECT。
 - SOCKS5 支持无认证及用户名/密码认证；域名交给代理解析；代理失败不回退直连。
-- Mac 自动保存身份并导出连接文件，重启保持有效，`--reset-pairing` 撤销旧凭据。
+- 服务端自动保存身份并导出连接文件，重启保持有效，`--reset-pairing` 撤销旧凭据。
 - 内部保持 TLS 1.3 双向认证，用户不需要操作证书。连接文件包含访问凭据，不应公开或提交到 Git。
 - Mac 使用 ScreenCaptureKit 枚举和捕获选定窗口；macOS / Windows 客户端在独立原生窗口显示 JPEG 预览。macOS 用 Core Animation 图像层按窗口 Retina 比例绘制，放大使用线性滤镜、缩小使用三线性滤镜，避免最近邻缩放把文字放大成像素块；鼠标继续由原生窗口处理，绘制与输入使用相同的等比例居中区域。
 - 输出保持比例，按 Retina 像素采集，长边最大 2560、短边最大 1440（支持竖屏）、10 FPS；JPEG 质量 95、4:4:4 色度；慢连接只保留最新帧；窗口缩放或移到另一显示器后，采集尺寸自动跟随，客户端标题栏显示实际接收像素。1 倍缩放显示器上的小窗口仍只有其自身像素，需放大源窗口或使用 HiDPI 才能增加细节。支持鼠标左/右/中键、双击、拖拽及滚轮。
 
 尚未实现：H.264 硬件编解码、键盘输入、WebRTC、代理 UDP 探测及传输切换。当前 JPEG 预览用于打通观看链路，不代表已完成目标中的 H.264 低延迟远控。
+
+## Windows 完整桌面服务端
+
+Windows 的 `serve` 默认共享整个虚拟桌面，`serve --desktop` 可显式选择；包含全部显示器及其负坐标布局。`--view-only` 禁用鼠标控制，`--check-only` 仍只做网络诊断；Windows 不接受 `--window-id` 或 `--virtual-display`。Mac 保持单窗口共享，暂不支持 `--desktop`。
+
+独立线程使用 Per-Monitor V2 DPI 坐标、GDI 顶向下 32 位 DIB 与 StretchBlt 采集完整桌面。保持比例缩小至长边不超过 2560、短边不超过 1440，不放大源图像；最多 10 FPS，JPEG 95 / 4:4:4。多屏总面积越大，每个屏幕在客户端中的有效像素越少。受保护视频或不支持 GDI 采集的内容可能为空白。GDI 对象仅在采集线程使用并按顺序释放；采集失败清除旧画面，本地恢复后自动重试，客户端需要重新连接。
+
+复用现有持久配对、双向 TLS、SOCKS5、独立控制连接及会话心跳。SendInput 使用 ABSOLUTE / VIRTUALDESK 将客户端归一化坐标映射到完整桌面。保留最近 32 帧的物理桌面边界，显示器布局变化后拒绝旧帧操作；采集暂停、连接结束及服务关闭时尝试释放按键。仅一个客户端可取得鼠标控制。输入受 Windows UIPI 权限限制，不能控制权限更高的程序。
+
+服务运行在当前交互用户的桌面，不是 Windows 后台系统服务。启动要求桌面已解锁；锁屏或切换至 UAC 安全桌面时停止画面和控制，不实现 Windows 远程解锁。客户端不会索取 Windows 登录密码。无需人工生成或交换证书，复制服务端导出的 `.local/host/connect.json` 即可。
+
+验证边界：按用户要求，本次不编译 Windows 产物、不触发 Windows CI，也不安装 Windows SDK 或交叉编译工具。本机只验证 macOS 和共享模块；Windows 原生 API 路径仍待 Windows 构建与实机验收，不能以本机检查代替。
+
+API 依据：[StretchBlt](https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-stretchblt)、[SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput)、[MOUSEINPUT 虚拟桌面坐标](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-mouseinput)。
 
 ## 构建
 

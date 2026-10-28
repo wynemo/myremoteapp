@@ -1,5 +1,7 @@
 #[cfg(any(target_os = "macos", test))]
 mod capture_readiness;
+#[cfg(any(target_os = "windows", test))]
+mod desktop_geometry;
 #[cfg(target_os = "macos")]
 mod input_macos;
 #[cfg(target_os = "macos")]
@@ -10,6 +12,8 @@ mod pairing;
 mod preview;
 #[cfg(target_os = "macos")]
 mod unlock_macos;
+#[cfg(target_os = "windows")]
+mod windows_host;
 #[cfg(target_os = "macos")]
 mod workspace_macos;
 
@@ -27,7 +31,7 @@ use std::{
 use tokio::{net::TcpListener, sync::Semaphore};
 
 #[derive(Parser)]
-#[command(about = "MyRemoteApp 单窗口共享与鼠标控制（键盘尚未实现）")]
+#[command(about = "MyRemoteApp 窗口/Windows 桌面共享与鼠标控制（键盘尚未实现）")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -50,7 +54,7 @@ enum Command {
     },
     /// 列出 Mac 当前可共享的 App 窗口及 ID。
     Windows,
-    /// 启动 Mac 服务，并选择要共享的窗口。
+    /// 启动共享服务：Mac 选择窗口，Windows 共享整个桌面。
     Serve {
         #[arg(long, default_value = "0.0.0.0:9443")]
         listen: String,
@@ -62,6 +66,9 @@ enum Command {
         /// 指定共享窗口 ID；省略时显示列表供选择。
         #[arg(long, conflicts_with = "check_only")]
         window_id: Option<u32>,
+        /// 共享 Windows 整个桌面（包含所有显示器）；Windows 默认使用此模式。
+        #[arg(long, conflicts_with_all = ["window_id", "virtual_display", "check_only"])]
+        desktop: bool,
         /// 将目标 App 移到独立 HiDPI 虚拟屏并放大；停止共享时尝试恢复窗口。
         #[arg(long, conflicts_with = "check_only")]
         virtual_display: bool,
@@ -192,9 +199,20 @@ async fn main() -> Result<()> {
             reset_pairing,
             window_id,
             virtual_display,
+            desktop,
             check_only,
             view_only,
         } => {
+            #[cfg(not(target_os = "windows"))]
+            anyhow::ensure!(
+                !desktop,
+                "--desktop 当前仅支持 Windows 服务端；Mac 请共享指定窗口"
+            );
+            #[cfg(target_os = "windows")]
+            anyhow::ensure!(
+                window_id.is_none() && !virtual_display,
+                "Windows 服务端共享整个桌面，不支持 --window-id 或 --virtual-display"
+            );
             let listener = TcpListener::bind(&listen).await?;
             #[cfg(target_os = "macos")]
             let mut capture = if check_only {
@@ -204,7 +222,18 @@ async fn main() -> Result<()> {
             };
             #[cfg(target_os = "macos")]
             let mut preview = capture.as_ref().map(|capture| capture.source.clone());
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "windows")]
+            let capture = if check_only {
+                None
+            } else {
+                Some(windows_host::start(view_only)?)
+            };
+            #[cfg(target_os = "windows")]
+            let preview = {
+                let _ = desktop;
+                capture.as_ref().map(|capture| capture.source.clone())
+            };
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             let preview = {
                 let _ = (window_id, view_only, virtual_display);
                 anyhow::ensure!(
@@ -342,6 +371,18 @@ async fn shutdown_signal() -> std::io::Result<()> {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn desktop_selection_rejects_conflicting_capture_modes() {
+        for args in [
+            vec!["remote-cli", "serve", "--desktop", "--window-id", "123"],
+            vec!["remote-cli", "serve", "--desktop", "--virtual-display"],
+            vec!["remote-cli", "serve", "--desktop", "--check-only"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(Cli::try_parse_from(["remote-cli", "serve", "--desktop", "--view-only"]).is_ok());
+    }
 
     #[test]
     fn connection_check_cannot_create_a_virtual_display() {
