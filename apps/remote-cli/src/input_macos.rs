@@ -235,6 +235,18 @@ fn exposed(pid: i32, wanted: Rect, point: Point) -> bool {
             && (s.height - wanted.size.height).abs() < 3.0
     }
 }
+fn prepare_target(pid: i32, wanted: Rect, point: Point) -> Result<()> {
+    // Keep hit testing on every click/scroll, but avoid expensive AX window
+    // enumeration and activation when the target is already active and exposed.
+    let active = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+        .is_some_and(|app| app.isActive());
+    if active && exposed(pid, wanted, point) {
+        return Ok(());
+    }
+    raise_window(pid, wanted)?;
+    wait_until_exposed(pid, wanted, point)
+}
+
 fn wait_until_exposed(pid: i32, wanted: Rect, point: Point) -> Result<()> {
     // AX hit testing respects transparent Dock/overlay regions; bounding-box
     // window lists cannot distinguish those from actual overlapping controls.
@@ -398,8 +410,7 @@ impl MacInput {
             MouseAction::Button { button, down: true } => {
                 let index = button_index(button);
                 if !state.held[index] {
-                    raise_window(self.pid, current)?;
-                    wait_until_exposed(self.pid, current, point)?;
+                    prepare_target(self.pid, current, point)?;
                     let count = state
                         .last_click
                         .filter(|(b, p, t, _)| {
@@ -416,8 +427,7 @@ impl MacInput {
                 }
             }
             MouseAction::Scroll { dx, dy } => {
-                raise_window(self.pid, current)?;
-                wait_until_exposed(self.pid, current, point)?;
+                prepare_target(self.pid, current, point)?;
                 let event = Owned(unsafe {
                     CGEventCreateScrollWheelEvent(
                         std::ptr::null(),

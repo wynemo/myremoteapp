@@ -121,6 +121,86 @@ mod connection {
         time::{Duration, timeout},
     };
 
+    // Collapse only consecutive motion: clicks, releases and scrolling are
+    // ordering barriers and must keep their exact position in the stream.
+    fn coalesce_motion(
+        mut message: Message,
+        input: &mut mpsc::Receiver<Message>,
+        pending: &mut Option<Message>,
+    ) -> Message {
+        while matches!(
+            message,
+            Message::Mouse {
+                event: MouseEvent {
+                    kind: MouseAction::Move,
+                    ..
+                }
+            }
+        ) {
+            match input.try_recv() {
+                Ok(
+                    next @ Message::Mouse {
+                        event:
+                            MouseEvent {
+                                kind: MouseAction::Move,
+                                ..
+                            },
+                    },
+                ) => message = next,
+                Ok(next) => {
+                    *pending = Some(next);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        message
+    }
+
+    #[cfg(test)]
+    mod queue_tests {
+        use super::*;
+        #[tokio::test]
+        async fn motion_uses_latest_position_without_crossing_button_or_release() {
+            let movement = |x| Message::Mouse {
+                event: MouseEvent {
+                    frame_sequence: 1,
+                    x,
+                    y: 0,
+                    kind: MouseAction::Move,
+                },
+            };
+            let button = || Message::Mouse {
+                event: MouseEvent {
+                    frame_sequence: 1,
+                    x: 2,
+                    y: 0,
+                    kind: MouseAction::Button {
+                        button: MouseButton::Left,
+                        down: true,
+                    },
+                },
+            };
+            let (tx, mut rx) = mpsc::channel(8);
+            for message in [
+                movement(1),
+                movement(2),
+                button(),
+                movement(3),
+                Message::ReleaseInput,
+            ] {
+                tx.try_send(message).unwrap();
+            }
+            let mut pending = None;
+            let first = rx.recv().await.unwrap();
+            assert_eq!(coalesce_motion(first, &mut rx, &mut pending), movement(2));
+            assert_eq!(pending.take(), Some(button()));
+            let next = rx.recv().await.unwrap();
+            assert_eq!(coalesce_motion(next, &mut rx, &mut pending), movement(3));
+            assert_eq!(pending.take(), Some(Message::ReleaseInput));
+        }
+    }
+
     #[derive(Clone, PartialEq)]
     pub enum Status {
         Ready,
@@ -147,11 +227,13 @@ mod connection {
                 let result: Result<()> = async {
                     let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
                     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    let mut pending = None;
                     loop {
-                        let message = tokio::select! {
+                        let message = if let Some(message) = pending.take() { message } else { tokio::select! {
                             message=input.recv()=>match message {Some(message)=>message,None=>break},
                             _=heartbeat.tick()=>Message::Ping { sequence:0 },
-                        };
+                        }};
+                        let message = coalesce_motion(message, &mut input, &mut pending);
                         timeout(remote_session::IO_TIMEOUT,write_message(&mut write,&message)).await??;
                         if message==Message::Goodbye { write.shutdown().await?; break; }
                     }
