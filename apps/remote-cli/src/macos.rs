@@ -304,7 +304,9 @@ fn start_with_workspace(
         .with_height(height)
         .with_pixel_format(PixelFormat::BGRA)
         .with_minimum_frame_interval(&CMTime::new(1, 10))
-        .with_shows_cursor(true)
+        // The viewer uses its local pointer; including the host cursor would
+        // show a second, delayed pointer in the captured image.
+        .with_shows_cursor(false)
         .with_captures_audio(false)
         .with_preserves_aspect_ratio(true)?
         .with_queue_depth(3);

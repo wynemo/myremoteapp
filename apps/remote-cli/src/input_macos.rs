@@ -37,6 +37,8 @@ unsafe extern "C" {
     fn CGWindowListCopyWindowInfo(options: u32, window: u32) -> Ref;
     static kCGWindowBounds: Ref;
     static kCGWindowOwnerPID: Ref;
+    static kCGWindowNumber: Ref;
+    static kCGWindowAlpha: Ref;
     fn CGRectMakeWithDictionaryRepresentation(dictionary: Ref, rect: *mut Rect) -> bool;
     fn CGEventCreateMouseEvent(source: Ref, kind: u32, point: Point, button: u32) -> Ref;
     fn CGEventCreateScrollWheelEvent(source: Ref, units: u32, count: u32, wheel1: i32, ...) -> Ref;
@@ -199,7 +201,19 @@ fn raise_window(pid: i32, wanted: Rect) -> Result<()> {
     Ok(())
 }
 
-fn exposed(pid: i32, wanted: Rect, point: Point) -> bool {
+fn ax_bounds(element: Ref) -> Option<Rect> {
+    let position = attribute(element, c"AXPosition")?;
+    let size = attribute(element, c"AXSize")?;
+    let mut rect = Rect::default();
+    // AX position and size values contain CGPoint and CGSize respectively.
+    unsafe {
+        (AXValueGetValue(position.0, 1, (&mut rect.origin as *mut Point).cast())
+            && AXValueGetValue(size.0, 2, (&mut rect.size as *mut Size).cast()))
+        .then_some(rect)
+    }
+}
+
+fn ax_exposed(window_id: u32, pid: i32, wanted: Rect, point: Point) -> bool {
     unsafe {
         let system = Owned(AXUIElementCreateSystemWide());
         if system.0.is_null() {
@@ -212,51 +226,241 @@ fn exposed(pid: i32, wanted: Rect, point: Point) -> bool {
         {
             return false;
         }
-        let hit = Owned(hit);
-        let mut owner = 0;
-        if AXUIElementGetPid(hit.0, &mut owner) != 0 || owner != pid {
-            return false;
+        let mut element = Owned(hit);
+        let mut ancestors = Vec::new();
+        // Embedded views can return a leaf whose reported bounds do not contain
+        // the query point. Walk its containers, bounded and within the same app.
+        for _ in 0..8 {
+            AXUIElementSetMessagingTimeout(element.0, 0.25);
+            let mut owner = 0;
+            if AXUIElementGetPid(element.0, &mut owner) != 0 || owner != pid {
+                break;
+            }
+            if let Some(window) = attribute(element.0, c"AXWindow") {
+                return ax_bounds(window.0).is_some_and(|r| {
+                    (r.origin.x - wanted.origin.x).abs() < 3.0
+                        && (r.origin.y - wanted.origin.y).abs() < 3.0
+                        && (r.size.width - wanted.size.width).abs() < 3.0
+                        && (r.size.height - wanted.size.height).abs() < 3.0
+                });
+            }
+            ancestors.push((owner, ax_bounds(element.0)));
+            let Some(parent) = attribute(element.0, c"AXParent") else {
+                break;
+            };
+            element = parent;
         }
-        let window = attribute(hit.0, c"AXWindow");
-        let window = window.as_ref().map_or(hit.0, |window| window.0);
-        let Some(position) = attribute(window, c"AXPosition") else {
-            return false;
-        };
-        let Some(size) = attribute(window, c"AXSize") else {
-            return false;
-        };
-        let mut p = Point::default();
-        let mut s = Size::default();
-        AXValueGetValue(position.0, 1, (&mut p as *mut Point).cast())
-            && AXValueGetValue(size.0, 2, (&mut s as *mut Size).cast())
-            && (p.x - wanted.origin.x).abs() < 3.0
-            && (p.y - wanted.origin.y).abs() < 3.0
-            && (s.width - wanted.size.width).abs() < 3.0
-            && (s.height - wanted.size.height).abs() < 3.0
+        window_stack().is_some_and(|windows| {
+            ancestors_belong_to_window(
+                &windows,
+                &StackedWindow {
+                    id: window_id,
+                    pid,
+                    bounds: wanted,
+                    alpha: 1.0,
+                },
+                &ancestors,
+                point,
+            )
+        })
     }
 }
-fn prepare_target(pid: i32, wanted: Rect, point: Point) -> Result<()> {
+
+struct StackedWindow {
+    id: u32,
+    pid: i32,
+    bounds: Rect,
+    alpha: f64,
+}
+
+fn top_window_at<'a>(
+    windows: impl IntoIterator<Item = &'a StackedWindow>,
+    point: Point,
+) -> Option<(u32, i32)> {
+    windows
+        .into_iter()
+        .find(|window| {
+            let r = window.bounds;
+            window.alpha > 0.0
+                && point.x >= r.origin.x
+                && point.y >= r.origin.y
+                && point.x < r.origin.x + r.size.width
+                && point.y < r.origin.y + r.size.height
+        })
+        .map(|window| (window.id, window.pid))
+}
+
+fn child_belongs_to_window(
+    windows: &[StackedWindow],
+    target: &StackedWindow,
+    child: Rect,
+    point: Point,
+) -> bool {
+    let wanted = target.bounds;
+    child.size.width > 0.0
+        && child.size.height > 0.0
+        && point.x >= child.origin.x
+        && point.y >= child.origin.y
+        && point.x < child.origin.x + child.size.width
+        && point.y < child.origin.y + child.size.height
+        && child.origin.x >= wanted.origin.x - 3.0
+        && child.origin.y >= wanted.origin.y - 3.0
+        && child.origin.x + child.size.width <= wanted.origin.x + wanted.size.width + 3.0
+        && child.origin.y + child.size.height <= wanted.origin.y + wanted.size.height + 3.0
+        // Other-process overlays have already been resolved by AX hit testing.
+        // Still distinguish overlapping windows belonging to the same app.
+        && top_window_at(windows.iter().filter(|w| w.pid == target.pid), point)
+            == Some((target.id, target.pid))
+}
+
+fn ancestors_belong_to_window(
+    windows: &[StackedWindow],
+    target: &StackedWindow,
+    ancestors: &[(i32, Option<Rect>)],
+    point: Point,
+) -> bool {
+    ancestors
+        .iter()
+        .take(8)
+        .take_while(|(owner, _)| *owner == target.pid)
+        .filter_map(|(_, bounds)| *bounds)
+        .any(|bounds| child_belongs_to_window(windows, target, bounds, point))
+}
+
+fn window_stack() -> Option<Vec<StackedWindow>> {
+    unsafe {
+        // On-screen windows are returned front to back, across all layers.
+        let list = Owned(CGWindowListCopyWindowInfo(1, 0));
+        if list.0.is_null() {
+            return None;
+        }
+        let mut windows = Vec::new();
+        for index in 0..CFArrayGetCount(list.0) {
+            let entry = CFArrayGetValueAtIndex(list.0, index);
+            let mut id = 0i32;
+            let mut owner = 0i32;
+            let mut alpha = 1.0f64;
+            let mut rect = Rect::default();
+            let id_value = CFDictionaryGetValue(entry, kCGWindowNumber);
+            let owner_value = CFDictionaryGetValue(entry, kCGWindowOwnerPID);
+            let alpha_value = CFDictionaryGetValue(entry, kCGWindowAlpha);
+            let rect_value = CFDictionaryGetValue(entry, kCGWindowBounds);
+            // Incomplete metadata cannot prove that the target is exposed.
+            if id_value.is_null()
+                || owner_value.is_null()
+                || alpha_value.is_null()
+                || rect_value.is_null()
+                || !CFNumberGetValue(id_value, 3, (&mut id as *mut i32).cast())
+                || !CFNumberGetValue(owner_value, 3, (&mut owner as *mut i32).cast())
+                || !CFNumberGetValue(alpha_value, 6, (&mut alpha as *mut f64).cast())
+                || !CGRectMakeWithDictionaryRepresentation(rect_value, &mut rect)
+            {
+                return None;
+            }
+            windows.push(StackedWindow {
+                id: id as u32,
+                pid: owner,
+                bounds: rect,
+                alpha,
+            });
+        }
+        Some(windows)
+    }
+}
+
+fn stack_exposed(window: u32, pid: i32, point: Point) -> bool {
+    window_stack().is_some_and(|windows| top_window_at(&windows, point) == Some((window, pid)))
+}
+
+fn exposed(window: u32, pid: i32, wanted: Rect, point: Point) -> bool {
+    // Some apps return an AX child without usable AXWindow/geometry metadata.
+    // The exact topmost CG window ID independently confirms those clicks.
+    // Keep AX hit testing for transparent Dock/overlay regions.
+    ax_exposed(window, pid, wanted, point) || stack_exposed(window, pid, point)
+}
+
+pub fn diagnose(window: u32, pid: i32, x: u16, y: u16) -> Result<()> {
+    let rect = bounds(window, pid)?;
+    let point = Point {
+        x: rect.origin.x + f64::from(x) / 65535.0 * rect.size.width,
+        y: rect.origin.y + f64::from(y) / 65535.0 * rect.size.height,
+    };
+    println!("{}", diagnostic_details(window, pid, rect, point));
+    Ok(())
+}
+
+fn diagnostic_details(window: u32, pid: i32, rect: Rect, point: Point) -> String {
+    use std::fmt::Write;
+    let top = window_stack().map(|windows| top_window_at(&windows, point));
+    let mut output = format!(
+        "trusted={} target={window}/{pid} bounds={rect:?} point={point:?} CG-top={top:?}",
+        unsafe { AXIsProcessTrusted() },
+    );
+    unsafe {
+        let system = Owned(AXUIElementCreateSystemWide());
+        if system.0.is_null() {
+            output.push_str("; AX system unavailable");
+            return output;
+        }
+        AXUIElementSetMessagingTimeout(system.0, 0.25);
+        let mut hit = std::ptr::null();
+        let status =
+            AXUIElementCopyElementAtPosition(system.0, point.x as f32, point.y as f32, &mut hit);
+        let _ = write!(output, "; AX-hit-status={status}");
+        if status == 0 && !hit.is_null() {
+            let mut element = Owned(hit);
+            for depth in 0..4 {
+                let mut owner = 0;
+                AXUIElementGetPid(element.0, &mut owner);
+                let mut p = Point::default();
+                let mut s = Size::default();
+                let position = attribute(element.0, c"AXPosition")
+                    .is_some_and(|v| AXValueGetValue(v.0, 1, (&mut p as *mut Point).cast()));
+                let size = attribute(element.0, c"AXSize")
+                    .is_some_and(|v| AXValueGetValue(v.0, 2, (&mut s as *mut Size).cast()));
+                let _ = write!(
+                    output,
+                    "; AX[{depth}] pid={owner} position={position}/{p:?} size={size}/{s:?} has-window={}",
+                    attribute(element.0, c"AXWindow").is_some()
+                );
+                let Some(parent) = attribute(element.0, c"AXParent") else {
+                    break;
+                };
+                element = parent;
+            }
+        }
+    }
+    output
+}
+
+fn prepare_target(window: u32, pid: i32, wanted: Rect, point: Point) -> Result<()> {
     // Keep hit testing on every click/scroll, but avoid expensive AX window
     // enumeration and activation when the target is already active and exposed.
     let active = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
         .is_some_and(|app| app.isActive());
-    if active && exposed(pid, wanted, point) {
+    if active && exposed(window, pid, wanted, point) {
         return Ok(());
     }
     raise_window(pid, wanted)?;
-    wait_until_exposed(pid, wanted, point)
+    wait_until_exposed(window, pid, wanted, point)
 }
 
-fn wait_until_exposed(pid: i32, wanted: Rect, point: Point) -> Result<()> {
-    // AX hit testing respects transparent Dock/overlay regions; bounding-box
-    // window lists cannot distinguish those from actual overlapping controls.
-    for _ in 0..15 {
-        if exposed(pid, wanted, point) {
+fn wait_until_exposed(window: u32, pid: i32, wanted: Rect, point: Point) -> Result<()> {
+    // Allow asynchronous application activation/window ordering to settle.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        if exposed(window, pid, wanted, point) {
             return Ok(());
+        }
+        if Instant::now() >= deadline {
+            break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    bail!("共享窗口被其他窗口遮挡，未发送点击；请在 Mac 将目标窗口置前后重试")
+    bail!(
+        "无法确认点击位置属于共享窗口，未发送操作。诊断：{}",
+        diagnostic_details(window, pid, wanted, point)
+    )
 }
 
 #[derive(Clone)]
@@ -410,7 +614,7 @@ impl MacInput {
             MouseAction::Button { button, down: true } => {
                 let index = button_index(button);
                 if !state.held[index] {
-                    prepare_target(self.pid, current, point)?;
+                    prepare_target(self.window, self.pid, current, point)?;
                     let count = state
                         .last_click
                         .filter(|(b, p, t, _)| {
@@ -427,7 +631,7 @@ impl MacInput {
                 }
             }
             MouseAction::Scroll { dx, dy } => {
-                prepare_target(self.pid, current, point)?;
+                prepare_target(self.window, self.pid, current, point)?;
                 let event = Owned(unsafe {
                     CGEventCreateScrollWheelEvent(
                         std::ptr::null(),
@@ -482,5 +686,234 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.0.release();
         self.0.leased.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn back_arrow_uses_containing_parent_when_ax_leaf_bounds_are_unrelated() {
+        let target = StackedWindow {
+            id: 25467,
+            pid: 78641,
+            bounds: Rect {
+                origin: Point { x: 584.0, y: 25.0 },
+                size: Size {
+                    width: 246.0,
+                    height: 465.0,
+                },
+            },
+            alpha: 1.0,
+        };
+        let leaf = Rect {
+            origin: Point { x: 659.0, y: 93.0 },
+            size: Size {
+                width: 33.0,
+                height: 13.0,
+            },
+        };
+        let parent = Rect {
+            origin: Point { x: 584.0, y: 53.0 },
+            size: Size {
+                width: 247.0,
+                height: 437.0,
+            },
+        };
+        let ancestors = [
+            (78641, Some(leaf)),
+            (78641, Some(parent)),
+            (63211, Some(parent)),
+        ];
+        let windows = [target];
+        for point in [
+            Point {
+                x: 602.2168001831083,
+                y: 66.96955825131609,
+            },
+            Point {
+                x: 600.4112611581597,
+                y: 65.52918287937743,
+            },
+        ] {
+            assert!(!ancestors_belong_to_window(
+                &windows,
+                &windows[0],
+                &ancestors[..1],
+                point
+            ));
+            assert!(ancestors_belong_to_window(
+                &windows,
+                &windows[0],
+                &ancestors,
+                point
+            ));
+            assert!(!ancestors_belong_to_window(
+                &windows,
+                &windows[0],
+                &[(78641, Some(leaf)), (63211, Some(parent))],
+                point
+            ));
+            assert!(!ancestors_belong_to_window(
+                &windows,
+                &windows[0],
+                &[(63211, Some(leaf)), (78641, Some(parent))],
+                point
+            ));
+            assert!(ancestors_belong_to_window(
+                &windows,
+                &windows[0],
+                &[(78641, None), (78641, Some(parent))],
+                point
+            ));
+        }
+        let overlap = StackedWindow {
+            id: 99,
+            ..window(99, 78641, 584.0, 1.0)
+        };
+        let overlap = StackedWindow {
+            bounds: windows[0].bounds,
+            ..overlap
+        };
+        let overlapped = [
+            overlap,
+            StackedWindow {
+                ..window(25467, 78641, 584.0, 1.0)
+            },
+        ];
+        assert!(!ancestors_belong_to_window(
+            &overlapped,
+            &windows[0],
+            &ancestors,
+            Point { x: 602.2, y: 66.9 }
+        ));
+    }
+
+    #[test]
+    fn ax_child_without_window_accepts_reported_tonghuashun_button() {
+        let target = StackedWindow {
+            id: 25467,
+            pid: 78641,
+            bounds: Rect {
+                origin: Point { x: 584.0, y: 25.0 },
+                size: Size {
+                    width: 246.0,
+                    height: 465.0,
+                },
+            },
+            alpha: 1.0,
+        };
+        let child = Rect {
+            origin: Point { x: 594.0, y: 399.0 },
+            size: Size {
+                width: 227.0,
+                height: 31.0,
+            },
+        };
+        let point = Point {
+            x: 694.6634012359808,
+            y: 410.8999771114672,
+        };
+        let overlay = StackedWindow {
+            id: 24,
+            pid: 1602,
+            bounds: Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 1920.0,
+                    height: 1080.0,
+                },
+            },
+            alpha: 1.0,
+        };
+        let windows = [overlay, target];
+        assert_eq!(top_window_at(&windows, point), Some((24, 1602)));
+        assert!(child_belongs_to_window(&windows, &windows[1], child, point));
+        assert!(!child_belongs_to_window(
+            &windows,
+            &windows[1],
+            child,
+            Point { x: 600.0, y: 380.0 }
+        ));
+        let oversized = Rect {
+            size: Size {
+                width: 500.0,
+                ..child.size
+            },
+            ..child
+        };
+        assert!(!child_belongs_to_window(
+            &windows,
+            &windows[1],
+            oversized,
+            point
+        ));
+        assert!(!child_belongs_to_window(
+            &windows[..1],
+            &windows[1],
+            child,
+            point
+        ));
+    }
+
+    #[test]
+    fn ax_child_does_not_authorize_an_overlapping_window_of_the_same_app() {
+        let mut windows = [window(2, 10, 0.0, 1.0), window(1, 10, 0.0, 1.0)];
+        let child = Rect {
+            origin: Point { x: 10.0, y: 10.0 },
+            size: Size {
+                width: 20.0,
+                height: 20.0,
+            },
+        };
+        let point = Point { x: 20.0, y: 20.0 };
+        assert!(!child_belongs_to_window(
+            &windows,
+            &windows[1],
+            child,
+            point
+        ));
+        windows[0].alpha = 0.0;
+        assert!(child_belongs_to_window(&windows, &windows[1], child, point));
+    }
+
+    fn window(id: u32, pid: i32, x: f64, alpha: f64) -> StackedWindow {
+        StackedWindow {
+            id,
+            pid,
+            bounds: Rect {
+                origin: Point { x, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 100.0,
+                },
+            },
+            alpha,
+        }
+    }
+
+    #[test]
+    fn stacking_checks_the_click_point_and_exact_window_not_just_pid() {
+        let windows = [window(2, 10, 50.0, 1.0), window(1, 10, 0.0, 1.0)];
+        assert_eq!(
+            top_window_at(&windows, Point { x: 75.0, y: 50.0 }),
+            Some((2, 10))
+        );
+        assert_eq!(
+            top_window_at(&windows, Point { x: 25.0, y: 50.0 }),
+            Some((1, 10))
+        );
+        assert_eq!(top_window_at(&windows, Point { x: 150.0, y: 50.0 }), None);
+    }
+
+    #[test]
+    fn stacking_ignores_invisible_windows_but_preserves_visible_overlays() {
+        let mut windows = [window(2, 20, 0.0, 0.0), window(1, 10, 0.0, 1.0)];
+        let point = Point { x: 50.0, y: 50.0 };
+        assert_eq!(top_window_at(&windows, point), Some((1, 10)));
+        windows[0].alpha = 0.5;
+        assert_eq!(top_window_at(&windows, point), Some((2, 20)));
+        assert_eq!(top_window_at(&windows[0..0], point), None);
     }
 }

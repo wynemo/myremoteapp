@@ -33,6 +33,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// 只读检查共享窗口的点击命中信息，不发送事件。
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    InputDiagnostics {
+        #[arg(long)]
+        window_id: u32,
+        #[arg(long)]
+        pid: i32,
+        #[arg(long, default_value_t = 32767)]
+        x: u16,
+        #[arg(long, default_value_t = 55000)]
+        y: u16,
+    },
     /// 列出 Mac 当前可共享的 App 窗口及 ID。
     Windows,
     /// 启动 Mac 服务，并选择要共享的窗口。
@@ -87,6 +100,15 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
+        #[cfg(target_os = "macos")]
+        Command::InputDiagnostics {
+            window_id,
+            pid,
+            x,
+            y,
+        } => {
+            input_macos::diagnose(window_id, pid, x, y)?;
+        }
         Command::Windows => {
             #[cfg(target_os = "macos")]
             macos::list_windows()?;
