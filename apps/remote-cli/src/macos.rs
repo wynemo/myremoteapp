@@ -359,6 +359,7 @@ fn start_with_workspace(
                 ..selected
             },
             frames: receiver,
+            demand: remote_session::PreviewDemand::default(),
             input: input.map(|input| {
                 Arc::new(super::input_macos::Controller(input))
                     as Arc<dyn remote_session::InputController>

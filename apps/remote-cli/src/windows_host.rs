@@ -2,7 +2,7 @@
 use crate::desktop_geometry::{DesktopFrames, DesktopRect};
 use anyhow::{Context, Result, ensure};
 use remote_protocol::{MouseAction, MouseButton, MouseEvent, PreviewFrame, WindowInfo};
-use remote_session::{CaptureEvent, InputController, InputSession, PreviewSource};
+use remote_session::{CaptureEvent, InputController, InputSession, PreviewDemand, PreviewSource};
 use std::{
     mem::{size_of, size_of_val},
     ptr::null_mut,
@@ -90,6 +90,8 @@ pub fn start(view_only: bool) -> Result<CaptureSession> {
     let input = Arc::new(Controller(Arc::new(Mutex::new(InputState::default()))));
     let (sender, frames) = watch::channel(None);
     let (init_tx, init_rx) = std::sync::mpsc::sync_channel(1);
+    let demand = PreviewDemand::default();
+    let capture_demand = demand.clone();
     let stopped = stop.clone();
     let controller = input.clone();
     let worker = std::thread::Builder::new()
@@ -104,12 +106,9 @@ pub fn start(view_only: bool) -> Result<CaptureSession> {
                     desktop_available(),
                     "请在已登录且解锁的 Windows 桌面启动服务"
                 );
-                let rect = desktop_rect()?;
-                let frame = capture(rect, 0)?;
-                ensure!(desktop_available(), "Windows 桌面已切换，请解锁后重试");
-                Ok((rect, frame))
+                desktop_rect()
             })();
-            let (rect, first) = match initial {
+            let rect = match initial {
                 Ok(value) => value,
                 Err(error) => {
                     let _ = init_tx.send(Err(format!("{error:#}")));
@@ -117,13 +116,22 @@ pub fn start(view_only: bool) -> Result<CaptureSession> {
                 }
             };
             let (width, height) = rect.frame_size();
-            controller.record(0, rect);
-            sender.send_replace(Some(CaptureEvent::Frame(Arc::new(first))));
             if init_tx.send(Ok((width, height))).is_err() {
                 return;
             }
-            let mut sequence = 1;
+            let mut sequence = 0;
+            let mut sharing = false;
             while !stopped.load(Ordering::Acquire) {
+                if !capture_demand.is_active() {
+                    if sharing {
+                        controller.stop();
+                        sender.send_replace(None);
+                        sharing = false;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                sharing = true;
                 let tick = Instant::now();
                 let result = (|| -> Result<_> {
                     ensure!(
@@ -163,7 +171,9 @@ pub fn start(view_only: bool) -> Result<CaptureSession> {
             anyhow::bail!(message);
         }
     };
-    println!("正在共享 Windows 整个桌面（包含所有显示器）：{width}×{height}，最多 10 FPS。");
+    println!(
+        "正在共享 Windows 整个桌面（包含所有显示器）：{width}×{height}，有客户端观看时采集，最多 10 FPS。"
+    );
     Ok(CaptureSession {
         source: PreviewSource {
             window: WindowInfo {
@@ -174,6 +184,7 @@ pub fn start(view_only: bool) -> Result<CaptureSession> {
                 height,
             },
             frames,
+            demand,
             input: if view_only { None } else { Some(input.clone()) },
         },
         stop,
@@ -264,7 +275,8 @@ fn capture(rect: DesktopRect, sequence: u64) -> Result<PreviewFrame> {
                 rect.y,
                 rect.width,
                 rect.height,
-                SRCCOPY | CAPTUREBLT
+                // CAPTUREBLT can hide/show the software cursor on every grab.
+                SRCCOPY
             ) != 0,
             "Windows 桌面采集失败"
         );

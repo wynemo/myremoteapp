@@ -5,7 +5,10 @@ use remote_protocol::{
     read_message, read_secret, write_frame, write_message, write_secret,
 };
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -27,6 +30,26 @@ pub struct PreviewSource {
     pub window: WindowInfo,
     pub frames: watch::Receiver<Option<CaptureEvent>>,
     pub input: Option<Arc<dyn InputController>>,
+    pub demand: PreviewDemand,
+}
+
+/// Counts actual video streams, independently of source clones or control sockets.
+#[derive(Clone, Default)]
+pub struct PreviewDemand(Arc<AtomicUsize>);
+impl PreviewDemand {
+    pub fn is_active(&self) -> bool {
+        self.0.load(Ordering::Acquire) != 0
+    }
+    fn subscribe(&self) -> PreviewSubscription {
+        self.0.fetch_add(1, Ordering::AcqRel);
+        PreviewSubscription(self.clone())
+    }
+}
+struct PreviewSubscription(PreviewDemand);
+impl Drop for PreviewSubscription {
+    fn drop(&mut self) {
+        self.0.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub trait InputController: Send + Sync {
@@ -299,6 +322,7 @@ async fn stream_preview<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     mut source: PreviewSource,
 ) -> Result<()> {
+    let _subscription = source.demand.subscribe();
     send(
         stream,
         &Message::PreviewStarted {
@@ -438,11 +462,14 @@ mod tests {
                 height: 4,
             },
             frames,
+            demand: PreviewDemand::default(),
             input: None,
         };
+        let demand = source.demand.clone();
         let (mut client, mut server) = tokio::io::duplex(1024);
         let host = tokio::spawn(async move { serve_with_preview(&mut server, Some(source)).await });
         assert_eq!(start_preview(&mut client).await.unwrap().id, 5);
+        assert!(demand.is_active());
         assert_eq!(
             remote_protocol::read_frame(&mut client)
                 .await
@@ -459,6 +486,56 @@ mod tests {
                 .is_none()
         );
         assert!(host.await.unwrap().is_err());
+        assert!(!demand.is_active());
+    }
+
+    #[tokio::test]
+    async fn capture_demand_tracks_only_video_and_releases_on_cancellation() {
+        let (_sender, frames) = watch::channel(None);
+        let demand = PreviewDemand::default();
+        let source = PreviewSource {
+            window: WindowInfo {
+                id: 5,
+                app: "Test".into(),
+                title: "Test".into(),
+                width: 4,
+                height: 4,
+            },
+            frames,
+            demand: demand.clone(),
+            input: None,
+        };
+        let idle_clone = source.clone();
+        assert!(!demand.is_active());
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let diagnostic = source.clone();
+        let host =
+            tokio::spawn(async move { serve_with_preview(&mut server, Some(diagnostic)).await });
+        probe(&mut client).await.unwrap();
+        host.await.unwrap().unwrap();
+        assert!(!demand.is_active());
+
+        let mut hosts = Vec::new();
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let (mut client, mut server) = tokio::io::duplex(1024);
+            let source = source.clone();
+            hosts.push(tokio::spawn(async move {
+                serve_with_preview(&mut server, Some(source)).await
+            }));
+            start_preview(&mut client).await.unwrap();
+            clients.push(client);
+        }
+        assert!(demand.is_active());
+        let host = hosts.pop().unwrap();
+        host.abort();
+        let _ = host.await;
+        assert!(demand.is_active(), "remaining viewer still needs capture");
+        let host = hosts.pop().unwrap();
+        host.abort();
+        let _ = host.await;
+        assert!(!demand.is_active(), "cancelled viewers must stop capture");
+        drop(idle_clone);
     }
 
     #[tokio::test]
@@ -512,6 +589,7 @@ mod tests {
                 height: 4,
             },
             frames,
+            demand: PreviewDemand::default(),
             input: Some(Arc::new(TestController(pressed.clone()))),
         };
         let (mut client, mut server) = tokio::io::duplex(2048);
@@ -558,6 +636,7 @@ mod tests {
                 height: 4,
             },
             frames,
+            demand: PreviewDemand::default(),
             input: None,
         };
         let (mut client, mut server) = tokio::io::duplex(2048);
