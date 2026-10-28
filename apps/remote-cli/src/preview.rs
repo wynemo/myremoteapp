@@ -51,6 +51,38 @@ async fn next_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<PreviewFrame
         .context("Mac 窗口采集已停止；请确认 Mac 已解锁、目标窗口仍打开，再重新启动共享")
 }
 
+// Reading must continue while JPEG decoding is busy: retain one compressed
+// frame, not a backlog of obsolete images in front of the decoder.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+async fn decode_latest_frames<F>(
+    mut incoming: tokio::sync::watch::Receiver<Result<std::sync::Arc<PreviewFrame>, String>>,
+    output: tokio::sync::watch::Sender<Result<std::sync::Arc<DecodedFrame>, String>>,
+    decode_frame: F,
+) where
+    F: Fn(&PreviewFrame) -> Result<DecodedFrame> + Send + Sync + 'static,
+{
+    let decode_frame = std::sync::Arc::new(decode_frame);
+    while incoming.changed().await.is_ok() {
+        let frame = incoming.borrow_and_update().clone();
+        let result = match frame {
+            Ok(frame) => {
+                let decoder = decode_frame.clone();
+                match tokio::task::spawn_blocking(move || decoder(&frame)).await {
+                    Ok(result) => result
+                        .map(std::sync::Arc::new)
+                        .map_err(|e| format!("{e:#}")),
+                    Err(error) => Err(format!("画面解码任务失败：{error}")),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let failed = result.is_err();
+        if output.send(result).is_err() || failed {
+            break;
+        }
+    }
+}
+
 pub async fn save_frame<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     path: &Path,
@@ -184,7 +216,8 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     use std::{sync::Arc, time::Duration};
     use tokio::sync::watch;
     let shared = remote_session::start_preview(&mut stream).await?;
-    let first = Arc::new(decode(&next_frame(&mut stream).await?)?);
+    let first_raw = Arc::new(next_frame(&mut stream).await?);
+    let first = Arc::new(decode(&first_raw)?);
     let input = if let Some(control) = control {
         Some(ControlClient::start(control, shared.id).await?)
     } else {
@@ -204,21 +237,17 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     #[cfg(target_os = "macos")]
     let mut renderer = macos_image::Renderer::new(&window)?;
     let (sender, receiver) = watch::channel(Ok::<_, String>(first));
+    let (compressed_tx, compressed_rx) = watch::channel(Ok(first_raw));
+    let decoder = tokio::spawn(decode_latest_frames(compressed_rx, sender, decode));
     let reader = tokio::spawn(async move {
         loop {
-            match next_frame(&mut stream)
+            let result = next_frame(&mut stream)
                 .await
-                .and_then(|frame| decode(&frame))
-            {
-                Ok(frame) => {
-                    if sender.send(Ok(Arc::new(frame))).is_err() {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    let _ = sender.send(Err(format!("{error:#}")));
-                    break;
-                }
+                .map(Arc::new)
+                .map_err(|error| format!("{error:#}"));
+            let failed = result.is_err();
+            if compressed_tx.send(result).is_err() || failed {
+                break;
             }
         }
     });
@@ -288,6 +317,7 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         Ok(())
     })();
     reader.abort();
+    decoder.abort();
     if let Some(input) = input {
         input.finish().await;
     }
@@ -317,6 +347,61 @@ mod tests {
             sequence: 1,
             jpeg,
         }
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[tokio::test]
+    async fn slow_decoder_skips_pending_old_frames_and_preserves_stop() {
+        use std::sync::{Arc, Mutex};
+        use tokio::sync::{Notify, watch};
+        let raw = Arc::new(image());
+        let (tx, rx) = watch::channel(Ok(raw.clone()));
+        let (output, mut received) = watch::channel(Ok(Arc::new(decode(&raw).unwrap())));
+        let started = Arc::new(Notify::new());
+        let notification = started.clone();
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = Mutex::new(wait);
+        let task = tokio::spawn(decode_latest_frames(rx, output, move |frame| {
+            if frame.sequence == 2 {
+                notification.notify_one();
+                wait.lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap();
+            }
+            decode(frame)
+        }));
+        let send = |sequence| {
+            let mut frame = image();
+            frame.sequence = sequence;
+            tx.send(Ok(Arc::new(frame))).unwrap();
+        };
+        send(2);
+        timeout(std::time::Duration::from_secs(3), started.notified())
+            .await
+            .unwrap();
+        send(3);
+        send(4);
+        release.send(()).unwrap();
+        timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                received.changed().await.unwrap();
+                let sequence = received.borrow_and_update().as_ref().unwrap().sequence;
+                assert_ne!(sequence, 3, "obsolete pending frame was decoded");
+                if sequence == 4 {
+                    break;
+                }
+            }
+            tx.send(Err("capture stopped".into())).unwrap();
+            received.changed().await.unwrap();
+            assert_eq!(
+                received.borrow_and_update().as_ref().unwrap_err(),
+                "capture stopped"
+            );
+            task.await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[test]

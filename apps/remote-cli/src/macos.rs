@@ -454,16 +454,25 @@ impl Handler {
             stride >= width * 4 && bytes.len() >= stride * height,
             "无效的像素行跨度"
         );
-        let mut packed = Vec::with_capacity(width * height * 4);
-        for row in bytes.chunks_exact(stride).take(height) {
-            packed.extend_from_slice(&row[..width * 4]);
-        }
+        // ScreenCaptureKit often supplies tightly packed BGRA already. Borrow
+        // it directly; only allocate/copy when rows contain alignment padding.
+        let packed;
+        let pixels = if stride == width * 4 {
+            &bytes[..width * height * 4]
+        } else {
+            packed = bytes
+                .chunks_exact(stride)
+                .take(height)
+                .flat_map(|row| row[..width * 4].iter().copied())
+                .collect::<Vec<_>>();
+            &packed
+        };
         let mut jpeg = Vec::new();
         let mut encoder = jpeg_encoder::Encoder::new(&mut jpeg, 95);
         // Preserve full chroma resolution: subsampling smears colored UI text.
         encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::R_4_4_4);
         encoder.encode(
-            &packed,
+            pixels,
             width as u16,
             height as u16,
             jpeg_encoder::ColorType::Bgra,
