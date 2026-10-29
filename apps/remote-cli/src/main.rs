@@ -69,9 +69,6 @@ enum Command {
         /// 共享 Windows 整个桌面（包含所有显示器）；Windows 默认使用此模式。
         #[arg(long, conflicts_with_all = ["window_id", "virtual_display", "check_only"])]
         desktop: bool,
-        /// Windows 实验：仅观看时继续尝试采集锁屏画面，记录系统实际返回的错误。
-        #[arg(long, requires = "view_only", conflicts_with_all = ["check_only", "window_id", "virtual_display"])]
-        experimental_lock_screen: bool,
         /// 将目标 App 移到独立 HiDPI 虚拟屏并放大；停止共享时尝试恢复窗口。
         #[arg(long, conflicts_with = "check_only")]
         virtual_display: bool,
@@ -203,14 +200,13 @@ async fn main() -> Result<()> {
             window_id,
             virtual_display,
             desktop,
-            experimental_lock_screen,
             check_only,
             view_only,
         } => {
             #[cfg(not(target_os = "windows"))]
             anyhow::ensure!(
-                !desktop && !experimental_lock_screen,
-                "--desktop 和 --experimental-lock-screen 仅支持 Windows 服务端"
+                !desktop,
+                "--desktop 当前仅支持 Windows 服务端；Mac 请共享指定窗口"
             );
             #[cfg(target_os = "windows")]
             anyhow::ensure!(
@@ -230,7 +226,7 @@ async fn main() -> Result<()> {
             let capture = if check_only {
                 None
             } else {
-                Some(windows_host::start(view_only, experimental_lock_screen)?)
+                Some(windows_host::start(view_only)?)
             };
             #[cfg(target_os = "windows")]
             let preview = {
@@ -386,33 +382,6 @@ mod cli_tests {
             assert!(Cli::try_parse_from(args).is_err());
         }
         assert!(Cli::try_parse_from(["remote-cli", "serve", "--desktop", "--view-only"]).is_ok());
-    }
-
-    #[test]
-    fn lock_screen_experiment_is_explicit_and_observation_only() {
-        assert!(
-            Cli::try_parse_from(["remote-cli", "serve", "--experimental-lock-screen"]).is_err()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "remote-cli",
-                "serve",
-                "--desktop",
-                "--experimental-lock-screen",
-                "--view-only"
-            ])
-            .is_ok()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "remote-cli",
-                "serve",
-                "--experimental-lock-screen",
-                "--view-only",
-                "--check-only"
-            ])
-            .is_err()
-        );
     }
 
     #[test]
