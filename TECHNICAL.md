@@ -9,15 +9,15 @@
 - Mac 使用 ScreenCaptureKit 枚举和捕获选定窗口；macOS / Windows 客户端在独立原生窗口显示 JPEG 预览。macOS 用 Core Animation 图像层按窗口 Retina 比例绘制，放大使用线性滤镜、缩小使用三线性滤镜，避免最近邻缩放把文字放大成像素块；鼠标按键继续由原生窗口处理；Mac 客户端直接将窗口鼠标位置转换到实际绘图视图的本地坐标，并读取该视图的实时尺寸，绘制与输入使用相同的等比例居中区域，不依赖 minifb 缓存的窗口尺寸或推算的内容区原点。
 - 输出保持比例，按 Retina 像素采集，长边最大 2560、短边最大 1440（支持竖屏）、10 FPS；JPEG 质量 95、4:4:4 色度；慢连接只保留最新帧；窗口缩放或移到另一显示器后，采集尺寸自动跟随，客户端标题栏显示实际接收像素。1 倍缩放显示器上的小窗口仍只有其自身像素，需放大源窗口或使用 HiDPI 才能增加细节。支持鼠标左/右/中键、双击、拖拽及滚轮。
 
-尚未实现：H.264 硬件编解码、键盘输入、WebRTC、代理 UDP 探测及传输切换。当前 JPEG 预览用于打通观看链路，不代表已完成目标中的 H.264 低延迟远控。
+尚未实现：H.264 硬件编解码、本地输入法文本提交和剪贴板同步、WebRTC、代理 UDP 探测及传输切换。当前 JPEG 预览用于打通观看链路，不代表已完成目标中的 H.264 低延迟远控。
 
 ## Windows 完整桌面服务端
 
-Windows 的 `serve` 默认共享整个虚拟桌面，`serve --desktop` 可显式选择；包含全部显示器及其负坐标布局。`--view-only` 禁用鼠标控制，`--check-only` 仍只做网络诊断；Windows 不接受 `--window-id` 或 `--virtual-display`。Mac 保持单窗口共享，暂不支持 `--desktop`。
+Windows 的 `serve` 默认共享整个虚拟桌面，`serve --desktop` 可显式选择；包含全部显示器及其负坐标布局。`--view-only` 禁用键鼠控制，`--check-only` 仍只做网络诊断；Windows 不接受 `--window-id` 或 `--virtual-display`。Mac 保持单窗口共享，暂不支持 `--desktop`。
 
 独立线程使用 Per-Monitor V2 DPI 坐标、GDI 顶向下 32 位 DIB 与 StretchBlt 采集完整桌面。保持比例缩小至长边不超过 2560、短边不超过 1440，不放大源图像；仅实际预览会话存续期间采集；启动待机和最后一个预览断开后不截图、不编码，采集线程每 100 ms 检查观看需求。诊断、状态查询、独立鼠标连接及源对象克隆不触发采集；预览失败或任务取消也会释放观看计数。最多 10 FPS，JPEG 95 / 4:4:4。使用 SRCCOPY，避免 CAPTUREBLT 在部分系统上反复隐藏/显示软件鼠标造成闪烁；部分分层或透明窗口可能无法完整采集。多屏总面积越大，每个屏幕在客户端中的有效像素越少。受保护视频或不支持 GDI 采集的内容可能为空白。GDI 对象仅在采集线程使用并按顺序释放；采集失败清除旧画面，本地恢复后自动重试，客户端需要重新连接。
 
-复用现有持久配对、双向 TLS、SOCKS5、独立控制连接及会话心跳。SendInput 使用 ABSOLUTE / VIRTUALDESK 将客户端归一化坐标映射到完整桌面。保留最近 32 帧的物理桌面边界，显示器布局变化后拒绝旧帧操作；采集暂停、连接结束及服务关闭时尝试释放按键。仅一个客户端可取得鼠标控制。输入受 Windows UIPI 权限限制，不能控制权限更高的程序。
+复用现有持久配对、双向 TLS、SOCKS5、独立控制连接及会话心跳。SendInput 使用 ABSOLUTE / VIRTUALDESK 将客户端归一化坐标映射到完整桌面。保留最近 32 帧的物理桌面边界，显示器布局变化后拒绝旧帧操作；采集暂停、连接结束及服务关闭时尝试释放按键。仅一个客户端可取得键鼠控制。输入受 Windows UIPI 权限限制，不能控制权限更高的程序。
 
 服务运行在当前交互用户的桌面，不是 Windows 后台系统服务。启动要求桌面已解锁；锁屏或切换至 UAC 安全桌面时停止画面和控制，不实现 Windows 远程解锁。客户端不会索取 Windows 登录密码。无需人工生成或交换证书，复制服务端导出的 `.local/host/connect.json` 即可。
 
@@ -37,7 +37,7 @@ cargo clippy --locked --release --workspace --all-targets -- -D warnings
 
 Mac 源码构建使用 Xcode 26.3 或更新版本，采集依赖需要 macOS 26 SDK；发布二进制使用系统 Swift 运行库，用户无需安装 Swift。当前运行验证环境为 macOS 26，旧版本 macOS 尚未验证。窗口采集需要屏幕录制权限。
 
-原生客户端回归检查：`python3 scripts/smoke_viewer.py --binary target/release/remote-cli`。macOS 本机可加 `--test-mouse`，在辅助功能权限允许时，仅向测试预览窗口发送左/右键事件并核对 TLS 控制消息；此检查曾复现旧版焦点判断反转导致点击丢失的问题。
+原生客户端回归检查：`python3 scripts/smoke_viewer.py --binary target/release/remote-cli`。Windows CI 加 `--test-keyboard` 向合成预览窗口投递键盘消息并核对 TLS 事件顺序、重复键、Esc、Win 键与失焦释放；macOS 本机可加 `--test-keyboard --test-mouse`，在辅助功能权限允许时仅向测试预览窗口注入键鼠事件，再隐藏该测试窗口验证失焦释放。此检查曾复现旧版焦点判断反转及左右修饰键被同时按下的问题。
 
 Mac 本机构建产物为 `target/release/remote-cli`。本机不安装 Windows 工具链、不交叉编译 Windows；Windows 构建和测试交给 GitHub Actions 的 Windows runner，具体约定见 [AGENTS.md](AGENTS.md)。
 
@@ -47,7 +47,7 @@ Mac 本机构建产物为 `target/release/remote-cli`。本机不安装 Windows 
 cargo run --locked --release -p remote-cli -- serve
 ```
 
-默认列出可见的普通 App 窗口，输入编号后只采集选中窗口，不会自动切换到整个桌面或其他窗口。Mac 首次选择窗口时必须解锁；首次运行需在系统设置中授予当前终端或应用屏幕录制权限，可能需要退出终端再重试。默认启用鼠标控制，还需辅助功能权限；Mac 首次选择窗口时需要解锁，运行中锁屏后可通过手动密码解锁。
+默认列出可见的普通 App 窗口，输入编号后只采集选中窗口，不会自动切换到整个桌面或其他窗口。Mac 首次选择窗口时必须解锁；首次运行需在系统设置中授予当前终端或应用屏幕录制权限，可能需要退出终端再重试。默认启用键鼠控制，还需辅助功能权限；Mac 首次选择窗口时需要解锁，运行中锁屏后可通过手动密码解锁。
 
 默认监听 `0.0.0.0:9443`，防火墙需允许此端口。可用 `--listen 127.0.0.1:9443` 限制本机访问。
 
@@ -79,7 +79,7 @@ cargo run --locked --release -p remote-cli -- serve --window-id 12345
 cargo run --locked --release -p remote-cli -- serve --check-only
 ```
 
-macOS / Windows 的 `connect` 默认打开可调整大小的原生窗口，并建立独立的鼠标控制连接；键盘输入暂不支持。`Esc` 或关闭窗口退出。诊断用途可加 `--check-only`；macOS 和 Windows 均可接收一帧验证传输：
+macOS / Windows 的 `connect` 默认打开可调整大小的原生窗口，并建立独立的键鼠控制连接。`Esc` 发送到远端，关闭窗口退出。诊断用途可加 `--check-only`；macOS 和 Windows 均可接收一帧验证传输：
 
 ```sh
 target/release/remote-cli connect --address 127.0.0.1:9443 \
@@ -92,7 +92,7 @@ target/release/remote-cli connect --address 127.0.0.1:9443 \
 
 初版预览复用同一条已认证 TLS 连接；客户端明确请求 `StartPreview` 后才开始发送画面，无需另开代理端口。JPEG 帧互相独立，可跳过积压的旧帧。每个接收端只持有最新帧，静止窗口每秒重发最后一帧作为保活。鼠标使用另一条独立的双向 TLS 连接，同样遵循指定的 SOCKS5 路由；无需在 Mac 新开端口。
 
-## 鼠标控制与权限
+## 键鼠控制与权限
 
 默认 `serve` 需要屏幕录制和辅助功能权限。缺少辅助功能权限时会请求系统提示，并要求在系统设置授权后重试。Mac 锁屏会暂停当前窗口共享；程序支持已登录用户会话的手动密码解锁，不提供开机登录、FileVault 磁盘解锁或独立的后台桌面。
 
@@ -101,7 +101,7 @@ target/release/remote-cli connect --address 127.0.0.1:9443 \
 cargo run --locked --release -p remote-cli -- serve --view-only
 ```
 
-客户端只观看时，在 `connect` 后加 `--view-only`。否则会用同一设备身份、同一 SOCKS5 路由，再建立一条 TLS 鼠标连接。一次只允许一个客户端获得鼠标控制，其他客户端可只观看。
+客户端只观看时，在 `connect` 后加 `--view-only`。否则会用同一设备身份、同一 SOCKS5 路由，再建立一条 TLS 键鼠连接。一次只允许一个客户端获得键鼠控制，其他客户端可只观看。
 
 坐标先去除客户端窗口的黑边，再用所显示帧的序号匹配 Mac 采集时的内容区域，转换到当前目标窗口位置。目标窗口调整尺寸后，旧帧上的点击会被拒绝，等待新画面即可重试；不会按旧比例误点。Mac 端在按下或滚轮前尝试激活目标窗口，并通过辅助功能命中测试确认目标位置；应用未返回完整辅助功能窗口信息时，补充查询系统窗口从前到后的层叠顺序，仅当点击位置最上层的窗口 ID 和进程都与共享目标一致时允许操作。若辅助功能已命中目标进程，但控件没有 `AXWindow`，则沿同一进程的辅助功能父级链最多检查 8 层，允许使用包含点击位置的父容器范围（叶子元素可能返回不包含该点的范围），遇到其他进程停止；同时在目标进程的窗口层叠中确认点击位置最前的窗口 ID 与共享目标一致；不再将控件尺寸与整个窗口尺寸比较。辅助功能已确认穿透的其他进程覆盖层不参与这一步的同应用窗口归属判断，同进程其他窗口仍会阻止错误点击。激活后等待最多约 500 ms 让窗口层叠稳定，不能确认时拒绝事件；错误提示不再将窗口信息缺失一律描述为遮挡。
 
@@ -109,7 +109,13 @@ cargo run --locked --release -p remote-cli -- serve --view-only
 
 左/右/中键、双击、拖拽与滚轮通过系统事件注入。客户端窗口失焦、移出画面、关闭窗口或正常断开时释放已按下的按钮；连接静默中断由心跳在约 10 秒内检测并释放。Mac 锁屏或采集结束也释放按钮。鼠标会影响 Mac 本地指针与目标窗口焦点，不提供与本地用户互不干扰的后台操作。
 
-当前控制协议为 v4，旧程序不兼容，升级时需要同时重启新版 Mac 服务并下载新版 Windows EXE；`connect.json` 不需要重新生成。
+键盘使用有界命名键事件 `Key { frame_sequence, key, down }`，与鼠标共用有序控制连接；字母、数字、标点、导航、功能键、数字小键盘和左右修饰键分别映射。客户端使用原生事件回调，保留同一刷新周期内的快速按下/松开和重复事件；移动合并不会跨过键盘事件。Mac 本地监听器仅处理当前预览窗口，区分左右修饰键并将 Command 组合键绕过本应用的退出/隐藏菜单；不安装全局键盘钩子。Command 对应 Windows 左/右 Win 键，Control 对应 Ctrl，Option 对应 Alt；`Esc` 转发到远端，关闭窗口退出，系统保留快捷键仍可能由本机截获。
+
+Windows 用 SendInput 注入命名虚拟键，保留右 Ctrl/Alt、导航键、Win 键和数字小键盘 Enter 的扩展键标志；Mac 用 CGEvent 键码、修饰标志与重复标志向选定 App 进程发送事件，并在按下前确认共享窗口焦点。Mac 的 Menu、Pause、ScrollLock 没有对应键，拒绝这些输入。输入使用服务端键盘布局/输入法，不转发客户端 Unicode/IME 提交文本；可在服务端切换输入法后用字母键输入拼音，但不保证所有输入法和 App 行为一致。Windows 普通桌面上的实际键盘效果仍需实机验收；不提供锁屏密码输入或 Ctrl+Alt+Del 安全注意序列。
+
+失焦时单独发送 ReleaseKeyboard，移出鼠标画面时只释放鼠标；窗口关闭、断流、采集暂停及会话取消释放全部已注入的按键。先释放普通键，再释放修饰键；Windows 若系统拒绝松开则保留状态供恢复后重试。重新聚焦不会自动重新按下失焦时仍被按住的键。`--view-only` 不建立控制连接，也不启用键盘捕获。
+
+当前控制协议为 v5，旧程序不兼容，升级时需要同时更新客户端和服务端并重启；Windows 需下载新版 EXE；`connect.json` 不需要重新生成。
 
 ## SOCKS5
 
@@ -169,12 +175,12 @@ Windows 上使用 `python` 或 `py -3` 替代 `python3`。默认读取 `wynemo/m
 | Windows x64 | windows-2022 | x86_64-pc-windows-msvc | ZIP |
 | macOS ARM64 | macos-26（Xcode 26.3） | aarch64-apple-darwin | tar.gz |
 
-两平台运行格式检查、Release Clippy、现有测试、Release 编译及二进制 `--help`。打包时校验 PE/Mach-O 架构，附带 SHA-256。日常构建在 Artifacts 下载；推送匹配 Cargo 版本的 `v*` 标签后自动发布 GitHub Release。当前包包含 macOS / Windows 原生窗口和鼠标控制，但不能输入键盘；macOS 二进制没有 Developer ID 签名或公证。
+两平台运行格式检查、Release Clippy、现有测试、Release 编译及二进制 `--help`。打包时校验 PE/Mach-O 架构，附带 SHA-256。日常构建在 Artifacts 下载；推送匹配 Cargo 版本的 `v*` 标签后自动发布 GitHub Release。当前包包含 macOS / Windows 原生窗口和键鼠控制；macOS 二进制没有 Developer ID 签名或公证。
 
 ## 后续实现
 
 1. VideoToolbox H.264 硬编与独立视频传输；Windows Media Foundation 解码和 D3D11 显示。
-2. 键盘输入、组合键和文本输入。
+2. 本地输入法文本提交和剪贴板同步。
 3. WebRTC 优先、SOCKS5 UDP 能力探测与 TLS/TCP 传输切换。
 
 Rust 承担共享协议、会话与传输，平台能力调用原生 API。窗口采集不等于独立后台桌面；操作可能影响 Mac 本地焦点。应用可达性与具体 App 的输入兼容性需逐项验证。

@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail, ensure};
 use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
-use remote_protocol::{MouseAction, MouseButton, MouseEvent};
+use remote_protocol::{KeyCode, KeyEvent, MouseAction, MouseButton, MouseEvent};
 use remote_session::{InputController, InputSession};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     ffi::{c_char, c_void},
     sync::{
         Arc, Mutex,
@@ -45,6 +45,10 @@ unsafe extern "C" {
     fn CGEventSetLocation(event: Ref, point: Point);
     fn CGEventSetIntegerValueField(event: Ref, field: u32, value: i64);
     fn CGEventPost(tap: u32, event: Ref);
+    fn CGEventCreateKeyboardEvent(source: Ref, virtual_key: u16, down: bool) -> Ref;
+    fn CGEventSetFlags(event: Ref, flags: u64);
+    fn CGEventSetType(event: Ref, kind: u32);
+    fn CGEventPostToPid(pid: i32, event: Ref);
 }
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
@@ -488,11 +492,58 @@ impl Default for Buttons {
     }
 }
 
+#[derive(Default)]
+struct KeyboardState {
+    held: BTreeSet<KeyCode>,
+    caps_lock: bool,
+}
+fn keyboard_flags(state: &KeyboardState) -> u64 {
+    let mut flags = if state.caps_lock { 1 << 16 } else { 0 };
+    for key in &state.held {
+        flags |= match key {
+            KeyCode::LeftShift | KeyCode::RightShift => 1 << 17,
+            KeyCode::LeftCtrl | KeyCode::RightCtrl => 1 << 18,
+            KeyCode::LeftAlt | KeyCode::RightAlt => 1 << 19,
+            KeyCode::LeftSuper | KeyCode::RightSuper => 1 << 20,
+            _ => 0,
+        };
+    }
+    flags
+}
+fn keyboard_window_focused(window: u32, pid: i32, wanted: Rect) -> bool {
+    if !NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+        .is_some_and(|app| app.isActive())
+    {
+        return false;
+    }
+    let center = Point {
+        x: wanted.origin.x + wanted.size.width / 2.0,
+        y: wanted.origin.y + wanted.size.height / 2.0,
+    };
+    if !window_stack().is_some_and(|windows| {
+        top_window_at(windows.iter().filter(|w| w.pid == pid), center) == Some((window, pid))
+    }) {
+        return false;
+    }
+    unsafe {
+        let app = Owned(AXUIElementCreateApplication(pid));
+        attribute(app.0, c"AXFocusedWindow")
+            .and_then(|window| ax_bounds(window.0))
+            .is_some_and(|rect| {
+                (rect.origin.x - wanted.origin.x).abs() < 3.0
+                    && (rect.origin.y - wanted.origin.y).abs() < 3.0
+                    && (rect.size.width - wanted.size.width).abs() < 3.0
+                    && (rect.size.height - wanted.size.height).abs() < 3.0
+            })
+    }
+}
+
 pub struct MacInput {
     window: u32,
     pid: i32,
     geometry: Mutex<VecDeque<Geometry>>,
     buttons: Mutex<Buttons>,
+    keyboard: Mutex<KeyboardState>,
     leased: AtomicBool,
     available: AtomicBool,
 }
@@ -503,6 +554,7 @@ impl MacInput {
             pid,
             geometry: Mutex::new(VecDeque::new()),
             buttons: Mutex::new(Buttons::default()),
+            keyboard: Mutex::new(KeyboardState::default()),
             leased: AtomicBool::new(false),
             available: AtomicBool::new(true),
         })
@@ -532,11 +584,19 @@ impl MacInput {
         ensure!(!event.0.is_null(), "无法创建鼠标事件");
         unsafe {
             CGEventSetIntegerValueField(event.0, 1, clicks);
+            CGEventSetFlags(
+                event.0,
+                keyboard_flags(&self.keyboard.lock().unwrap_or_else(|e| e.into_inner())),
+            );
             CGEventPost(0, event.0);
         }
         Ok(())
     }
     fn release(&self) {
+        self.release_mouse();
+        self.release_keyboard();
+    }
+    fn release_mouse(&self) {
         let mut state = self.buttons.lock().unwrap_or_else(|e| e.into_inner());
         for (button, kind) in [2, 4, 26].into_iter().enumerate() {
             if state.held[button] {
@@ -544,6 +604,86 @@ impl MacInput {
                 state.held[button] = false;
             }
         }
+    }
+    fn post_key(&self, state: &mut KeyboardState, key: KeyCode, down: bool) -> Result<()> {
+        let code = crate::keyboard::macos_key(key).context("Mac 不支持此按键")?;
+        let event = Owned(unsafe { CGEventCreateKeyboardEvent(std::ptr::null(), code, down) });
+        ensure!(!event.0.is_null(), "无法创建键盘事件");
+        let repeated = down && state.held.contains(&key);
+        if down {
+            state.held.insert(key);
+        } else {
+            state.held.remove(&key);
+        }
+        if key == KeyCode::CapsLock && down {
+            state.caps_lock = !state.caps_lock;
+        }
+        unsafe {
+            CGEventSetFlags(event.0, keyboard_flags(state));
+            CGEventSetIntegerValueField(event.0, 8, i64::from(repeated));
+            if key.is_modifier() || key == KeyCode::CapsLock {
+                CGEventSetType(event.0, 12);
+            }
+            // Target the selected app; never type into another foreground app.
+            CGEventPostToPid(self.pid, event.0);
+        }
+        Ok(())
+    }
+    fn release_keyboard(&self) {
+        let mut state = self.keyboard.lock().unwrap_or_else(|e| e.into_inner());
+        let mut keys: Vec<_> = state.held.iter().copied().collect();
+        keys.sort_by_key(|key| key.is_modifier());
+        for key in keys {
+            let _ = self.post_key(&mut state, key, false);
+        }
+    }
+    fn apply_key(&self, event: KeyEvent) -> Result<()> {
+        let mut state = self.keyboard.lock().unwrap_or_else(|e| e.into_inner());
+        if !event.down {
+            if state.held.contains(&event.key) {
+                self.post_key(&mut state, event.key, false)?;
+            }
+            return Ok(());
+        }
+        ensure!(
+            self.available.load(Ordering::Acquire) && !super::macos::is_locked(),
+            "Mac 已锁屏或共享已结束"
+        );
+        ensure!(
+            unsafe { AXIsProcessTrusted() },
+            "辅助功能权限已失效，请在 Mac 重新授权"
+        );
+        let geometry = self
+            .geometry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|g| g.sequence == event.frame_sequence)
+            .cloned()
+            .context("画面已过期，请等待新画面")?;
+        let current = bounds(self.window, self.pid)?;
+        ensure!(
+            (current.size.width - geometry.bounds.size.width).abs() < 3.0
+                && (current.size.height - geometry.bounds.size.height).abs() < 3.0,
+            "窗口尺寸已变化，请等待新画面"
+        );
+        if !keyboard_window_focused(self.window, self.pid, current) {
+            raise_window(self.pid, current)?;
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while !keyboard_window_focused(self.window, self.pid, current)
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            ensure!(
+                keyboard_window_focused(self.window, self.pid, current),
+                "无法确认共享窗口的键盘焦点"
+            );
+        }
+        if state.held.contains(&event.key) && !event.key.repeatable() {
+            return Ok(());
+        }
+        self.post_key(&mut state, event.key, true)
     }
     fn apply(&self, event: MouseEvent) -> Result<()> {
         let mut state = self.buttons.lock().unwrap_or_else(|e| e.into_inner());
@@ -644,6 +784,10 @@ impl MacInput {
                 ensure!(!event.0.is_null(), "无法创建滚轮事件");
                 unsafe {
                     CGEventSetLocation(event.0, point);
+                    CGEventSetFlags(
+                        event.0,
+                        keyboard_flags(&self.keyboard.lock().unwrap_or_else(|e| e.into_inner())),
+                    );
                     CGEventPost(0, event.0);
                 }
             }
@@ -677,6 +821,15 @@ struct Session(Arc<MacInput>);
 impl InputSession for Session {
     fn apply(&mut self, event: MouseEvent) -> Result<()> {
         self.0.apply(event)
+    }
+    fn apply_key(&mut self, event: KeyEvent) -> Result<()> {
+        self.0.apply_key(event)
+    }
+    fn release_mouse(&mut self) {
+        self.0.release_mouse();
+    }
+    fn release_keyboard(&mut self) {
+        self.0.release_keyboard();
     }
     fn release_all(&mut self) {
         self.0.release();

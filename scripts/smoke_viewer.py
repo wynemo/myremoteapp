@@ -6,6 +6,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -55,12 +56,14 @@ def main():
     parser.add_argument("--binary", required=True, type=pathlib.Path)
     parser.add_argument("--test-mouse", action="store_true",
                         help="macOS local input regression check (requires Accessibility)")
+    parser.add_argument("--test-keyboard", action="store_true",
+                        help="exercise native key capture (macOS needs Accessibility)")
     args = parser.parse_args()
     binary = args.binary.resolve()
     with tempfile.TemporaryDirectory(prefix="myremoteapp-viewer-") as directory:
         root = pathlib.Path(directory)
         input_helper = root / "viewer-input"
-        if args.test_mouse:
+        if args.test_mouse or (args.test_keyboard and sys.platform == "darwin"):
             subprocess.run(["xcrun", "swiftc", str(pathlib.Path(__file__).with_name("smoke_viewer_input.swift")),
                             "-o", str(input_helper)], check=True, capture_output=True)
         provision = subprocess.Popen(
@@ -123,7 +126,7 @@ def main():
                         sequence = 0
                         for width, height in [(320, 180), (180, 320)]:
                             jpeg = gray_jpeg(width, height)
-                            for _ in range(10):
+                            for _ in range(25 if args.test_keyboard else 10):
                                 stream.sendall(struct.pack("!IIIQ", len(jpeg), width,
                                                            height, sequence) + jpeg)
                                 sequence += 1
@@ -161,9 +164,14 @@ def main():
                  str(root / "host" / "connect.json")],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
             try:
-                if args.test_mouse:
-                    subprocess.run([str(input_helper), str(client.pid)], check=True,
-                                   capture_output=True, timeout=10)
+                if sys.platform == "win32" and args.test_keyboard:
+                    from smoke_viewer_keyboard_windows import send_test_keys
+                    send_test_keys(client.pid)
+                elif args.test_mouse or args.test_keyboard:
+                    helper_args = [str(input_helper), str(client.pid)]
+                    if args.test_keyboard:
+                        helper_args.append("--keyboard")
+                    subprocess.run(helper_args, check=True, capture_output=True, timeout=10)
                 stdout, stderr = client.communicate(timeout=25)
                 result = subprocess.CompletedProcess(client.args, client.returncode, stdout, stderr)
             finally:
@@ -185,6 +193,21 @@ def main():
                     for down in [True, False]:
                         assert {"action": "button", "button": button, "down": down} in actions, actions
                 print("Native mouse: focused macOS viewer sends left/right down and up over TLS.")
+            if args.test_keyboard:
+                keys = [(message["event"]["key"], message["event"]["down"])
+                        for message in received if message["type"] == "key"]
+                expected = [("left_ctrl", True), ("a", True), ("a", True),
+                            ("a", False), ("left_ctrl", False),
+                            ("escape", True), ("escape", False),
+                            ("left_super", True), ("a", True), ("a", False),
+                            ("left_super", False), ("left_super", True),
+                            ("q", True), ("q", False), ("left_super", False), ("left_ctrl", True)]
+                # User input can arrive before the fixture's injected sequence.
+                # Require the entire injected sequence, in order and contiguous.
+                assert any(keys[start:start + len(expected)] == expected
+                           for start in range(len(keys) - len(expected) + 1)), keys
+                assert "release_keyboard" in kinds, received
+                print("Native keyboard: Ctrl chord, key repeat, Escape, Command/Windows key, ordered releases and focus-loss release passed.")
             print("Native viewer: landscape/portrait decode and presentation, authenticated control heartbeat, stop and input release passed.")
         finally:
             listener.close()

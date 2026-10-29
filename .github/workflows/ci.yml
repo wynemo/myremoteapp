@@ -99,7 +99,9 @@ jobs:
         run: |
           binary="target/$BUILD_TARGET/release/remote-cli"
           if [[ "$RUNNER_OS" == Windows ]]; then binary="$binary.exe"; fi
-          python scripts/smoke_viewer.py --binary "$binary"
+          args=(--binary "$binary")
+          if [[ "$RUNNER_OS" == Windows ]]; then args+=(--test-keyboard); fi
+          python scripts/smoke_viewer.py "${args[@]}"
 
       - name: Package and verify architecture
         id: package

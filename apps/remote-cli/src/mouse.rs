@@ -65,7 +65,7 @@ impl MouseTracker {
             .filter(|_| sample.active);
         let Some((x, y)) = point else {
             if self.held.iter().any(|held| *held) {
-                output.push(Message::ReleaseInput);
+                output.push(Message::ReleaseMouse);
             }
             self.held = [false; 3];
             self.point = None;
@@ -240,7 +240,7 @@ mod connection {
                     Ok(())
                 }.await;
                 if let Err(error) = result {
-                    failure.send_replace(Status::Failed(format!("鼠标连接已断开：{error:#}")));
+                    failure.send_replace(Status::Failed(format!("控制连接已断开：{error:#}")));
                 }
             });
             let reader = tokio::spawn(async move {
@@ -254,7 +254,7 @@ mod connection {
                         }
                         result => {
                             status_tx.send_replace(Status::Failed(format!(
-                                "鼠标连接已断开，请重新连接：{result:?}"
+                                "控制连接已断开，请重新连接：{result:?}"
                             )));
                             break;
                         }
@@ -281,7 +281,7 @@ mod connection {
                             ..
                         },
                 })) => Ok(()),
-                Err(_) => bail!("鼠标连接拥堵或断开，请重新连接"),
+                Err(_) => bail!("控制连接拥堵或断开，请重新连接"),
             }
         }
         pub async fn finish(mut self) {
@@ -373,7 +373,7 @@ mod tests {
         let mut current = sample();
         current.active = false;
         current.buttons[0] = true;
-        assert_eq!(tracker.update(current), vec![Message::ReleaseInput]);
+        assert_eq!(tracker.update(current), vec![Message::ReleaseMouse]);
         let mut current = sample();
         current.buttons[0] = true;
         assert!(!tracker.update(current).iter().any(|m| matches!(
