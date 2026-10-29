@@ -201,7 +201,9 @@ def main():
                             ("escape", True), ("escape", False),
                             ("left_super", True), ("a", True), ("a", False),
                             ("left_super", False), ("left_super", True),
-                            ("q", True), ("q", False), ("left_super", False), ("left_ctrl", True)]
+                            ("q", True), ("q", False), ("left_super", False),
+                            ("left_alt", True), ("left", True), ("left", False), ("left_alt", False),
+                            ("right_alt", True), ("right_alt", False), ("left_ctrl", True)]
                 # User input can arrive before the fixture's injected sequence.
                 # Require the entire injected sequence, in order and contiguous.
                 assert any(keys[start:start + len(expected)] == expected

@@ -67,6 +67,12 @@ if testKeyboard {
     key(0x0c, true, .maskCommand) // Command-Q must go remote, not quit locally.
     key(0x0c, false, .maskCommand)
     key(0x37, false)
+    key(0x3a, true, .maskAlternate)
+    key(0x7b, true, .maskAlternate)
+    key(0x7b, false, .maskAlternate)
+    key(0x3a, false)
+    key(0x3d, true, .maskAlternate)
+    key(0x3d, false)
     key(0x3b, true, .maskControl)
     // Only hide the synthetic viewer; its focus loss must release remote Ctrl.
     app.hide()

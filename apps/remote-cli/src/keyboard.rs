@@ -352,16 +352,19 @@ impl minifb::InputCallback for KeyboardQueue {
     fn add_char(&mut self, _: u32) {}
     fn set_key_state(&mut self, key: minifb::Key, down: bool) {
         if let Some(key) = from_native(key) {
-            let mut pending = self.0.lock().unwrap();
-            if pending.events.len() < 1024 {
-                pending.events.push((key, down));
-            } else {
-                pending.overflow = true;
-            }
+            self.record(key, down);
         }
     }
 }
 impl KeyboardQueue {
+    fn record(&self, key: KeyCode, down: bool) {
+        let mut pending = self.0.lock().unwrap();
+        if pending.events.len() < 1024 {
+            pending.events.push((key, down));
+        } else {
+            pending.overflow = true;
+        }
+    }
     pub fn drain(&self) -> anyhow::Result<Vec<(KeyCode, bool)>> {
         let mut pending = self.0.lock().unwrap();
         anyhow::ensure!(!pending.overflow, "键盘事件队列已满，请重新连接");
@@ -532,5 +535,83 @@ mod tests {
             vec![(KeyCode::A, true), (KeyCode::A, false)]
         );
         assert!(queue.drain().unwrap().is_empty());
+    }
+}
+
+// minifb's Windows scan-code table omits Alt, Win and F13-F15. Intercept only
+// these messages on this viewer window; other keys keep the normal callback.
+#[cfg(target_os = "windows")]
+pub mod windows_capture {
+    use super::*;
+    use windows_sys::Win32::{
+        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+        UI::{
+            Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
+            WindowsAndMessaging::*,
+        },
+    };
+    pub struct Capture {
+        window: HWND,
+        queue: Box<KeyboardQueue>,
+    }
+    impl Capture {
+        pub fn attach(window: &minifb::Window, queue: KeyboardQueue) -> anyhow::Result<Self> {
+            let capture = Self {
+                window: window.get_window_handle(),
+                queue: Box::new(queue),
+            };
+            let data = (&*capture.queue as *const KeyboardQueue) as usize;
+            anyhow::ensure!(
+                unsafe { SetWindowSubclass(capture.window, Some(procedure), data, data) } != 0,
+                "无法启用 Windows 预览窗口键盘捕获"
+            );
+            Ok(capture)
+        }
+    }
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            let data = (&*self.queue as *const KeyboardQueue) as usize;
+            unsafe {
+                RemoveWindowSubclass(self.window, Some(procedure), data);
+            }
+        }
+    }
+    unsafe extern "system" fn procedure(
+        window: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        id: usize,
+        data: usize,
+    ) -> LRESULT {
+        if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP) {
+            let key = match wparam as u16 {
+                0x5b => Some(KeyCode::LeftSuper),
+                0x5c => Some(KeyCode::RightSuper),
+                0xa4 => Some(KeyCode::LeftAlt),
+                0xa5 => Some(KeyCode::RightAlt),
+                0x12 => Some(if lparam & (1 << 24) == 0 {
+                    KeyCode::LeftAlt
+                } else {
+                    KeyCode::RightAlt
+                }),
+                0x7c => Some(KeyCode::F13),
+                0x7d => Some(KeyCode::F14),
+                0x7e => Some(KeyCode::F15),
+                _ => None,
+            };
+            if let Some(key) = key {
+                // The boxed queue lives until Capture removes this subclass.
+                let queue = unsafe { &*(data as *const KeyboardQueue) };
+                queue.record(key, matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN));
+                return 0;
+            }
+        }
+        if message == WM_NCDESTROY {
+            unsafe {
+                RemoveWindowSubclass(window, Some(procedure), id);
+            }
+        }
+        unsafe { DefSubclassProc(window, message, wparam, lparam) }
     }
 }

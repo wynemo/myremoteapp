@@ -260,6 +260,15 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     if input.is_some() {
         window.set_input_callback(Box::new(keyboard_queue.clone()));
     }
+    #[cfg(target_os = "windows")]
+    let _keyboard_capture = if input.is_some() {
+        Some(crate::keyboard::windows_capture::Capture::attach(
+            &window,
+            keyboard_queue.clone(),
+        )?)
+    } else {
+        None
+    };
     let mut keyboard = KeyboardTracker::default();
     #[cfg(target_os = "macos")]
     let mut renderer = macos_image::Renderer::new(&window)?;

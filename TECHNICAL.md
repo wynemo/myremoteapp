@@ -111,7 +111,7 @@ cargo run --locked --release -p remote-cli -- serve --view-only
 
 键盘使用有界命名键事件 `Key { frame_sequence, key, down }`，与鼠标共用有序控制连接；字母、数字、标点、导航、功能键、数字小键盘和左右修饰键分别映射。客户端使用原生事件回调，保留同一刷新周期内的快速按下/松开和重复事件；移动合并不会跨过键盘事件。Mac 本地监听器仅处理当前预览窗口，区分左右修饰键并将 Command 组合键绕过本应用的退出/隐藏菜单；不安装全局键盘钩子。Command 对应 Windows 左/右 Win 键，Control 对应 Ctrl，Option 对应 Alt；`Esc` 转发到远端，关闭窗口退出，系统保留快捷键仍可能由本机截获。
 
-Windows 用 SendInput 注入命名虚拟键，保留右 Ctrl/Alt、导航键、Win 键和数字小键盘 Enter 的扩展键标志；Mac 用 CGEvent 键码、修饰标志与重复标志向选定 App 进程发送事件，并在按下前确认共享窗口焦点。Mac 的 Menu、Pause、ScrollLock 没有对应键，拒绝这些输入。输入使用服务端键盘布局/输入法，不转发客户端 Unicode/IME 提交文本；可在服务端切换输入法后用字母键输入拼音，但不保证所有输入法和 App 行为一致。Windows 普通桌面上的实际键盘效果仍需实机验收；不提供锁屏密码输入或 Ctrl+Alt+Del 安全注意序列。
+Windows 客户端以窗口子类回调补齐 minifb 缺失的 Win、左右 Alt 与 F13–F15 事件，仅监听当前预览窗口并在销毁前卸载。Windows 服务端用 SendInput 注入命名虚拟键，保留右 Ctrl/Alt、导航键、Win 键和数字小键盘 Enter 的扩展键标志；Mac 用 CGEvent 键码、修饰标志与重复标志向选定 App 进程发送事件，并在按下前确认共享窗口焦点。Mac 的 Menu、Pause、ScrollLock 没有对应键，拒绝这些输入。输入使用服务端键盘布局/输入法，不转发客户端 Unicode/IME 提交文本；可在服务端切换输入法后用字母键输入拼音，但不保证所有输入法和 App 行为一致。Windows 普通桌面上的实际键盘效果仍需实机验收；不提供锁屏密码输入或 Ctrl+Alt+Del 安全注意序列。
 
 失焦时单独发送 ReleaseKeyboard，移出鼠标画面时只释放鼠标；窗口关闭、断流、采集暂停及会话取消释放全部已注入的按键。先释放普通键，再释放修饰键；Windows 若系统拒绝松开则保留状态供恢复后重试。重新聚焦不会自动重新按下失焦时仍被按住的键。`--view-only` 不建立控制连接，也不启用键盘捕获。
 

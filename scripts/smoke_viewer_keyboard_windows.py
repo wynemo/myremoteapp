@@ -33,13 +33,14 @@ def send_test_keys(pid):
     user.SetForegroundWindow(window)
     time.sleep(0.2)
 
-    def key(vk, scan, down, extended=False, repeat=False):
+    def key(vk, scan, down, extended=False, repeat=False, system=False):
         bits = 1 | (scan << 16) | (int(extended) << 24)
         if repeat:
             bits |= 1 << 30
         if not down:
             bits |= (1 << 30) | (1 << 31)
-        if not user.PostMessageW(window, 0x100 if down else 0x101, vk, bits):
+        message = (0x104 if down else 0x105) if system else (0x100 if down else 0x101)
+        if not user.PostMessageW(window, message, vk, bits):
             raise ctypes.WinError(ctypes.get_last_error())
         time.sleep(0.05)
 
@@ -58,6 +59,12 @@ def send_test_keys(pid):
     key(0x51, 0x10, True)
     key(0x51, 0x10, False)
     key(0x5b, 0x5b, False, extended=True)
+    key(0x12, 0x38, True, system=True)
+    key(0x25, 0x4b, True, extended=True, system=True)
+    key(0x25, 0x4b, False, extended=True, system=True)
+    key(0x12, 0x38, False, system=True)
+    key(0x12, 0x38, True, extended=True, system=True)
+    key(0x12, 0x38, False, extended=True, system=True)
     # Leave Ctrl held, then hide only this fixture to exercise focus release.
     key(0xa2, 0x1d, True)
     user.ShowWindow(window, 0)
