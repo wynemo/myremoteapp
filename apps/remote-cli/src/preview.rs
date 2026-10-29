@@ -222,7 +222,17 @@ fn viewer_active(window: &minifb::Window) -> bool {
         native.isKeyWindow()
     }
     #[cfg(target_os = "windows")]
-    window.is_active()
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, IsIconic, IsWindowVisible,
+        };
+        let handle = window.get_window_handle();
+        // minifb queries GetActiveWindow, which is scoped to this thread and
+        // can retain a window after its application loses foreground focus.
+        unsafe {
+            GetForegroundWindow() == handle && IsWindowVisible(handle) != 0 && IsIconic(handle) == 0
+        }
+    }
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
