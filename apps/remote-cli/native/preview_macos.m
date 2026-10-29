@@ -84,6 +84,28 @@ bool remote_preview_present(void *handle, const uint32_t *pixels, size_t width, 
     return true;
 }
 
+// Read position and size from the exact view that displays the image. minifb's
+// cached size updates only at the end of live resize and its mouse origin is
+// reconstructed from the window frame rather than this view's coordinate space.
+static bool preview_input_geometry(RemotePreviewImageView *view, NSPoint windowPoint,
+                                   float *x, float *y, size_t *width, size_t *height) {
+    if (!view || !view.window) return false;
+    NSRect bounds = view.bounds;
+    NSPoint local = [view convertPoint:windowPoint fromView:nil];
+    *x = local.x - bounds.origin.x;
+    *y = local.y - bounds.origin.y;
+    *width = (size_t)MAX(0, floor(bounds.size.width));
+    *height = (size_t)MAX(0, floor(bounds.size.height));
+    return *width > 0 && *height > 0;
+}
+
+bool remote_preview_mouse(void *handle, float *x, float *y, size_t *width, size_t *height) {
+    RemotePreviewImageView *view = (__bridge RemotePreviewImageView *)handle;
+    if (!view || !view.window) return false;
+    return preview_input_geometry(view, view.window.mouseLocationOutsideOfEventStream,
+                                  x, y, width, height);
+}
+
 void remote_preview_destroy(void *handle) {
     RemotePreviewImageView *view = (__bridge_transfer RemotePreviewImageView *)handle;
     [view removeFromSuperview];

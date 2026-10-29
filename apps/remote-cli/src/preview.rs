@@ -143,6 +143,13 @@ mod macos_image {
             width: usize,
             height: usize,
         ) -> bool;
+        fn remote_preview_mouse(
+            view: *mut c_void,
+            x: *mut f32,
+            y: *mut f32,
+            width: *mut usize,
+            height: *mut usize,
+        ) -> bool;
         fn remote_preview_destroy(view: *mut c_void);
     }
     pub struct Renderer {
@@ -158,6 +165,12 @@ mod macos_image {
                 view,
                 last_frame: None,
             })
+        }
+        pub fn mouse_geometry(&self) -> (Option<(f32, f32)>, (usize, usize)) {
+            let (mut x, mut y, mut width, mut height) = (0.0, 0.0, 0, 0);
+            let available =
+                unsafe { remote_preview_mouse(self.view, &mut x, &mut y, &mut width, &mut height) };
+            (available.then_some((x, y)), (width, height))
         }
         pub fn present(&mut self, window: &mut minifb::Window, frame: &DecodedFrame) -> Result<()> {
             let key = (frame.sequence, frame.width, frame.height);
@@ -212,7 +225,9 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     control: Option<S>,
 ) -> Result<()> {
     use crate::mouse::{ControlClient, MouseSample, MouseTracker, Status};
-    use minifb::{Key, MouseButton, MouseMode};
+    #[cfg(target_os = "windows")]
+    use minifb::MouseMode;
+    use minifb::{Key, MouseButton};
     use std::{sync::Arc, time::Duration};
     use tokio::sync::watch;
     let shared = remote_session::start_preview(&mut stream).await?;
@@ -293,9 +308,16 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                 }
                             }
                         }
+                        #[cfg(target_os = "macos")]
+                        let (position, size) = renderer.mouse_geometry();
+                        #[cfg(target_os = "windows")]
+                        let (position, size) = (
+                            window.get_unscaled_mouse_pos(MouseMode::Discard),
+                            window.get_size(),
+                        );
                         for event in mouse.update(MouseSample {
-                            position: window.get_unscaled_mouse_pos(MouseMode::Discard),
-                            window: window.get_size(),
+                            position,
+                            window: size,
                             frame: (frame.width, frame.height),
                             sequence: frame.sequence,
                             buttons: [

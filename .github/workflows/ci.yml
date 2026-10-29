@@ -76,6 +76,10 @@ jobs:
       - name: Test
         run: cargo test --locked --release --workspace --target ${{ matrix.target }}
 
+      - name: Test native macOS preview coordinates
+        if: runner.os == 'macOS'
+        run: bash scripts/test_preview_geometry.sh
+
       - name: Build release binary
         run: cargo build --locked --release -p remote-cli --target ${{ matrix.target }}
 

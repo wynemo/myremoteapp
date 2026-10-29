@@ -24,11 +24,11 @@ fn normalize(
     {
         return None;
     }
-    let aspect = fw as f32 / fh as f32;
-    let (w, h) = if aspect > ww as f32 / wh as f32 {
-        (ww, (ww as f32 / aspect) as usize)
+    let aspect = fw as f64 / fh as f64;
+    let (w, h) = if aspect > ww as f64 / wh as f64 {
+        (ww, (ww as f64 / aspect) as usize)
     } else {
-        ((wh as f32 * aspect) as usize, wh)
+        ((wh as f64 * aspect) as usize, wh)
     };
     if w == 0 || h == 0 {
         return None;
@@ -328,6 +328,33 @@ mod tests {
         assert!(normalize((500.0, 50.0), (1000, 1000), (1280, 720)).is_none());
         let (x, y) = normalize((500.0, 500.0), (1000, 1000), (1280, 720)).unwrap();
         assert!((i32::from(x) - 32768).abs() < 100 && (i32::from(y) - 32768).abs() < 100);
+    }
+    #[test]
+    fn native_view_coordinates_match_landscape_portrait_and_live_resize() {
+        // Expected rectangles also verified against the actual CALayer in the
+        // native regression. Sample a grid, including the last visible pixels.
+        for (window, frame, (left, top, width, height)) in [
+            ((1000, 800), (1920, 1080), (0.0, 119.0, 1000.0, 562.0)),
+            ((800, 600), (1920, 1080), (0.0, 75.0, 800.0, 450.0)),
+            ((800, 600), (1080, 1920), (231.0, 0.0, 337.0, 600.0)),
+        ] {
+            for row in 0..5 {
+                for column in 0..5 {
+                    let x = (width - 1.0) * f64::from(column) / 4.0;
+                    let y = (height - 1.0) * f64::from(row) / 4.0;
+                    let actual =
+                        normalize(((left + x) as f32, (top + y) as f32), window, frame).unwrap();
+                    let expected = (
+                        ((x + 0.5) * 65535.0 / width).round() as u16,
+                        ((y + 0.5) * 65535.0 / height).round() as u16,
+                    );
+                    assert!((i32::from(actual.0) - i32::from(expected.0)).abs() <= 1);
+                    assert!((i32::from(actual.1) - i32::from(expected.1)).abs() <= 1);
+                }
+            }
+            assert!(normalize((left as f32 - 1.0, top as f32), window, frame).is_none());
+            assert!(normalize((left as f32, top as f32 - 1.0), window, frame).is_none());
+        }
     }
     #[test]
     fn release_on_focus_loss_and_no_press_when_reentering_held() {
