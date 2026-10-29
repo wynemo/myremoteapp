@@ -8,10 +8,6 @@
 @property(nonatomic, strong) CALayer *picture;
 @property(nonatomic) size_t imageWidth;
 @property(nonatomic) size_t imageHeight;
-@property(nonatomic, strong) id keyboardMonitor;
-@property(nonatomic, strong) id keyboardFocusObserver;
-@property(nonatomic, strong) NSMutableIndexSet *modifierKeys;
-@property(nonatomic) BOOL lastCapsLock;
 @end
 
 @implementation RemotePreviewImageView
@@ -110,82 +106,7 @@ bool remote_preview_mouse(void *handle, float *x, float *y, size_t *width, size_
                                   x, y, width, height);
 }
 
-static void preview_key_transition(NSWindow *window, NSEvent *source, unsigned short key, BOOL down) {
-    NSEvent *translated = [NSEvent keyEventWithType:down ? NSEventTypeKeyDown : NSEventTypeKeyUp
-        location:source.locationInWindow modifierFlags:source.modifierFlags timestamp:source.timestamp
-        windowNumber:window.windowNumber context:nil characters:@"" charactersIgnoringModifiers:@""
-        isARepeat:NO keyCode:key];
-    if (down) [window keyDown:translated];
-    else [window keyUp:translated];
-}
-
-void remote_preview_keyboard_enabled(void *handle, bool enabled) {
-    RemotePreviewImageView *view = (__bridge RemotePreviewImageView *)handle;
-    if (view.keyboardMonitor) {
-        [NSEvent removeMonitor:view.keyboardMonitor];
-        view.keyboardMonitor = nil;
-    }
-    if (view.keyboardFocusObserver) {
-        [NSNotificationCenter.defaultCenter removeObserver:view.keyboardFocusObserver];
-        view.keyboardFocusObserver = nil;
-    }
-    if (enabled) {
-        view.modifierKeys = [NSMutableIndexSet indexSet];
-        view.lastCapsLock = (NSEvent.modifierFlags & NSEventModifierFlagCapsLock) != 0;
-        __weak RemotePreviewImageView *weakView = view;
-        view.keyboardFocusObserver = [NSNotificationCenter.defaultCenter
-            addObserverForName:nil object:view.window queue:nil
-            usingBlock:^(NSNotification *note) {
-                if ([note.name isEqualToString:NSWindowDidResignKeyNotification]) {
-                    [weakView.modifierKeys removeAllIndexes];
-                } else if ([note.name isEqualToString:NSWindowDidBecomeKeyNotification]) {
-                    weakView.lastCapsLock = (NSEvent.modifierFlags & NSEventModifierFlagCapsLock) != 0;
-                }
-            }];
-        // Local monitor only: no global keyboard hook or monitoring permission.
-        // Route Command combinations past local Quit/Hide menu shortcuts, and
-        // retain the actual modifier side (minifb's aggregate fallback sets both).
-        view.keyboardMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:
-            NSEventMaskKeyDown | NSEventMaskFlagsChanged handler:^NSEvent *(NSEvent *event) {
-                RemotePreviewImageView *current = weakView;
-                NSWindow *target = current.window;
-                if (!target || !target.isKeyWindow || event.window != target) return event;
-                if (event.type == NSEventTypeFlagsChanged) {
-                    unsigned short code = event.keyCode;
-                    if (code == 57) {
-                        BOOL caps = (event.modifierFlags & NSEventModifierFlagCapsLock) != 0;
-                        if (caps != current.lastCapsLock) {
-                            current.lastCapsLock = caps;
-                            preview_key_transition(target, event, code, YES);
-                            preview_key_transition(target, event, code, NO);
-                        }
-                        return nil;
-                    }
-                    NSEventModifierFlags mask = 0;
-                    switch (code) {
-                        case 54: case 55: mask = NSEventModifierFlagCommand; break;
-                        case 56: case 60: mask = NSEventModifierFlagShift; break;
-                        case 58: case 61: mask = NSEventModifierFlagOption; break;
-                        case 59: case 62: mask = NSEventModifierFlagControl; break;
-                        default: return nil;
-                    }
-                    BOOL down = (event.modifierFlags & mask) && ![current.modifierKeys containsIndex:code];
-                    if (down) [current.modifierKeys addIndex:code];
-                    else [current.modifierKeys removeIndex:code];
-                    preview_key_transition(target, event, code, down);
-                    return nil;
-                }
-                if (event.modifierFlags & NSEventModifierFlagCommand) {
-                    [target sendEvent:event];
-                    return nil;
-                }
-                return event;
-            }];
-    }
-}
-
 void remote_preview_destroy(void *handle) {
-    remote_preview_keyboard_enabled(handle, false);
     RemotePreviewImageView *view = (__bridge_transfer RemotePreviewImageView *)handle;
     [view removeFromSuperview];
 }

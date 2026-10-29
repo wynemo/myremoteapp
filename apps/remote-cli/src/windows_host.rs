@@ -1,12 +1,9 @@
 //! Interactive Windows desktop host. All GDI objects stay on the capture thread.
 use crate::desktop_geometry::{DesktopFrames, DesktopRect};
 use anyhow::{Context, Result, ensure};
-use remote_protocol::{
-    KeyCode, KeyEvent, MouseAction, MouseButton, MouseEvent, PreviewFrame, WindowInfo,
-};
+use remote_protocol::{MouseAction, MouseButton, MouseEvent, PreviewFrame, WindowInfo};
 use remote_session::{CaptureEvent, InputController, InputSession, PreviewDemand, PreviewSource};
 use std::{
-    collections::BTreeSet,
     mem::{size_of, size_of_val},
     ptr::null_mut,
     sync::{
@@ -44,18 +41,6 @@ fn desktop_rect() -> Result<DesktopRect> {
         "无法读取 Windows 桌面尺寸"
     );
     Ok(rect)
-}
-
-fn physical_desktop_rect() -> Result<DesktopRect> {
-    // Capture and input must both measure physical pixels on their own threads.
-    let previous =
-        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-    ensure!(!previous.is_null(), "无法读取物理桌面坐标");
-    let result = desktop_rect();
-    unsafe {
-        SetThreadDpiAwarenessContext(previous);
-    }
-    result
 }
 
 // Never read or inject into a lock screen or UAC secure desktop. Opening the
@@ -327,7 +312,6 @@ struct InputState {
     active: bool,
     available: bool,
     held: [bool; 3],
-    keys: BTreeSet<KeyCode>,
     frames: DesktopFrames,
 }
 #[derive(Clone)]
@@ -336,10 +320,10 @@ impl Controller {
     fn record(&self, sequence: u64, rect: DesktopRect) {
         let mut state = self.0.lock().unwrap();
         if state.frames.layout_changed(rect) {
-            release_all_inputs(&mut state);
+            release_buttons(&mut state);
         }
         if !state.available {
-            release_all_inputs(&mut state);
+            release_buttons(&mut state);
         }
         state.available = true;
         state.frames.record(sequence, rect);
@@ -348,7 +332,7 @@ impl Controller {
         let mut state = self.0.lock().unwrap();
         state.available = false;
         state.frames.clear();
-        release_all_inputs(&mut state);
+        release_buttons(&mut state);
     }
 }
 impl InputController for Controller {
@@ -358,11 +342,11 @@ impl InputController for Controller {
             state.available && desktop_available(),
             "Windows 桌面当前不可控制"
         );
-        ensure!(!state.active, "另一个客户端正在控制键鼠");
-        release_all_inputs(&mut state);
+        ensure!(!state.active, "另一个客户端正在控制鼠标");
+        release_buttons(&mut state);
         ensure!(
-            !state.held.iter().any(|held| *held) && state.keys.is_empty(),
-            "无法释放之前的键鼠按键，请恢复 Windows 桌面后重试"
+            !state.held.iter().any(|held| *held),
+            "无法释放之前的鼠标按键，请恢复 Windows 桌面后重试"
         );
         state.active = true;
         Ok(Box::new(ControlSession(self.clone())))
@@ -378,10 +362,15 @@ impl InputSession for ControlSession {
                 .frames
                 .get(event.frame_sequence)
                 .context("画面已过期，请等待新画面")?;
-            ensure!(
-                rect == physical_desktop_rect()?,
-                "显示器布局已变化，请等待新画面"
-            );
+            // Physical coordinates on this Tokio worker must match capture's.
+            let previous =
+                unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+            ensure!(!previous.is_null(), "无法读取物理桌面坐标");
+            let current = desktop_rect();
+            unsafe {
+                SetThreadDpiAwarenessContext(previous);
+            }
+            ensure!(rect == current?, "显示器布局已变化，请等待新画面");
             send_mouse(
                 MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                 0,
@@ -419,53 +408,18 @@ impl InputSession for ControlSession {
             Ok(())
         })();
         if result.is_err() {
-            release_all_inputs(&mut state);
+            release_buttons(&mut state);
         }
         result
-    }
-    fn apply_key(&mut self, event: KeyEvent) -> Result<()> {
-        let mut state = self.0.0.lock().unwrap();
-        let result = (|| -> Result<()> {
-            if event.down {
-                ensure!(state.available && desktop_available(), "Windows 桌面已暂停");
-                let rect = state
-                    .frames
-                    .get(event.frame_sequence)
-                    .context("画面已过期，请等待新画面")?;
-                ensure!(
-                    rect == physical_desktop_rect()?,
-                    "显示器布局已变化，请等待新画面"
-                );
-                if state.keys.contains(&event.key) && !event.key.repeatable() {
-                    return Ok(());
-                }
-                send_key(event.key, true)?;
-                state.keys.insert(event.key);
-            } else if state.keys.contains(&event.key) {
-                send_key(event.key, false)?;
-                state.keys.remove(&event.key);
-            }
-            Ok(())
-        })();
-        if result.is_err() {
-            release_all_inputs(&mut state);
-        }
-        result
-    }
-    fn release_mouse(&mut self) {
-        release_mouse_buttons(&mut self.0.0.lock().unwrap());
-    }
-    fn release_keyboard(&mut self) {
-        release_keys(&mut self.0.0.lock().unwrap());
     }
     fn release_all(&mut self) {
-        release_all_inputs(&mut self.0.0.lock().unwrap());
+        release_buttons(&mut self.0.0.lock().unwrap());
     }
 }
 impl Drop for ControlSession {
     fn drop(&mut self) {
         let mut state = self.0.0.lock().unwrap();
-        release_all_inputs(&mut state);
+        release_buttons(&mut state);
         state.active = false;
     }
 }
@@ -479,20 +433,7 @@ fn button_flag(button: MouseButton, down: bool) -> (usize, u32) {
         (MouseButton::Middle, false) => (2, MOUSEEVENTF_MIDDLEUP),
     }
 }
-fn release_all_inputs(state: &mut InputState) {
-    release_mouse_buttons(state);
-    release_keys(state);
-}
-fn release_keys(state: &mut InputState) {
-    let mut keys: Vec<_> = state.keys.iter().copied().collect();
-    keys.sort_by_key(|key| key.is_modifier());
-    for key in keys {
-        if send_key(key, false).is_ok() {
-            state.keys.remove(&key);
-        }
-    }
-}
-fn release_mouse_buttons(state: &mut InputState) {
+fn release_buttons(state: &mut InputState) {
     for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
         let (index, flag) = button_flag(button, false);
         if state.held[index] && send_mouse(flag, 0, 0, 0).is_ok() {
@@ -517,28 +458,6 @@ fn send_mouse(flags: u32, data: u32, x: i32, y: i32) -> Result<()> {
     ensure!(
         unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1,
         "Windows 拒绝鼠标输入（不能控制权限更高的程序或安全桌面）"
-    );
-    Ok(())
-}
-
-fn send_key(key: KeyCode, down: bool) -> Result<()> {
-    let (virtual_key, extended) = crate::keyboard::windows_key(key);
-    let input = INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: virtual_key,
-                wScan: 0,
-                dwFlags: if extended { KEYEVENTF_EXTENDEDKEY } else { 0 }
-                    | if down { 0 } else { KEYEVENTF_KEYUP },
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    };
-    ensure!(
-        unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1,
-        "Windows 拒绝键盘输入（不能控制权限更高的程序或安全桌面）"
     );
     Ok(())
 }

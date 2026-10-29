@@ -1,8 +1,8 @@
 # MyRemoteApp
 
-在 macOS 或 Windows 上观看并用键盘和鼠标操作远端画面，支持 SOCKS5 代理。Mac 服务端共享指定 App 窗口；Windows 服务端共享整个桌面（包含所有显示器）。
+在 macOS 或 Windows 上观看并用鼠标操作远端画面，支持 SOCKS5 代理。Mac 服务端共享指定 App 窗口；Windows 服务端共享整个桌面（包含所有显示器）。
 
-**支持点击、双击、拖拽、滚轮、普通按键和组合键。Mac 首次选择窗口时需要解锁。**
+**当前支持点击、双击、拖拽和滚轮，键盘输入尚未实现。Mac 首次选择窗口时需要解锁。**
 
 ## Mac：选择共享窗口
 
@@ -58,11 +58,9 @@ Windows：
 .\remote-cli.exe connect --address 192.168.1.10:9443 --socks5 127.0.0.1:1080
 ```
 
-连接后自动打开可用键鼠操作的窗口；`Esc` 发送到远端，关闭窗口退出。代理需要认证时，设置 `REMOTEAPP_SOCKS5_USER` 和 `REMOTEAPP_SOCKS5_PASSWORD`。
+连接后自动打开可用鼠标操作的窗口，按 `Esc` 或关闭窗口退出。代理需要认证时，设置 `REMOTEAPP_SOCKS5_USER` 和 `REMOTEAPP_SOCKS5_PASSWORD`。
 
-Mac 的 Command 对应 Windows 键，Control 对应 Ctrl，Option 对应 Alt。键盘使用服务端布局与输入法；暂不转发本地输入法提交的中文文本或剪贴板，部分系统快捷键仍由本机处理。
-
-键鼠操作会影响服务端本地输入；Mac 上还会激活目标窗口。只观看时可在连接命令后加 `--view-only`。
+鼠标操作会影响服务端本地鼠标；Mac 上还会激活目标窗口。只观看时可在连接命令后加 `--view-only`。
 
 Mac 按 `Ctrl+C` 停止共享；换窗口时重新运行并选择。Mac 锁屏时会暂停预览；再次连接时，在客户端终端输入服务端 Mac 的登录密码即可尝试解锁并恢复原窗口。密码不回显、不保存，也不自动重试。目标窗口关闭后需要重新选择。
 

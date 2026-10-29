@@ -1,8 +1,8 @@
 //! Authenticated diagnostic, video, and mouse-control sessions.
 use anyhow::{Result, bail};
 use remote_protocol::{
-    ErrorCode, KeyEvent, Message, MouseEvent, PreviewFrame, UnlockOutcome, VERSION, WindowInfo,
-    end_preview, read_message, read_secret, write_frame, write_message, write_secret,
+    ErrorCode, Message, MouseEvent, PreviewFrame, UnlockOutcome, VERSION, WindowInfo, end_preview,
+    read_message, read_secret, write_frame, write_message, write_secret,
 };
 use std::{
     sync::{
@@ -59,15 +59,6 @@ pub trait InputController: Send + Sync {
 /// Implementors release all held buttons in Drop, including task cancellation.
 pub trait InputSession: Send {
     fn apply(&mut self, event: MouseEvent) -> Result<()>;
-    fn apply_key(&mut self, _event: KeyEvent) -> Result<()> {
-        bail!("服务端未启用键盘输入")
-    }
-    fn release_mouse(&mut self) {
-        self.release_all();
-    }
-    fn release_keyboard(&mut self) {
-        self.release_all();
-    }
     fn release_all(&mut self);
 }
 
@@ -202,7 +193,7 @@ pub async fn serve_with_host<S: AsyncRead + AsyncWrite + Unpin>(
                         },
                     )
                     .await?;
-                    bail!("当前共享未启用键鼠控制");
+                    bail!("当前共享未启用鼠标控制");
                 };
                 let mut input = match controller.acquire() {
                     Ok(input) => input,
@@ -232,20 +223,6 @@ pub async fn serve_with_host<S: AsyncRead + AsyncWrite + Unpin>(
                                 .await?;
                             }
                         }
-                        Message::Key { event } => {
-                            if let Err(error) = input.apply_key(event) {
-                                input.release_all();
-                                send(
-                                    stream,
-                                    &Message::InputError {
-                                        message: error.to_string(),
-                                    },
-                                )
-                                .await?;
-                            }
-                        }
-                        Message::ReleaseMouse => input.release_mouse(),
-                        Message::ReleaseKeyboard => input.release_keyboard(),
                         Message::ReleaseInput => input.release_all(),
                         Message::Ping { sequence } => {
                             send(stream, &Message::Pong { sequence }).await?
@@ -326,18 +303,18 @@ pub async fn start_control<S: AsyncRead + AsyncWrite + Unpin>(
     send(stream, &Message::Hello { version: VERSION }).await?;
     if timeout(IO_TIMEOUT, read_message(stream)).await?? != (Message::Welcome { version: VERSION })
     {
-        bail!("键鼠控制协议不兼容，请更新两端程序");
+        bail!("鼠标控制协议不兼容，请更新两端程序");
     }
     send(stream, &Message::StartControl { window_id }).await?;
     match timeout(IO_TIMEOUT, read_message(stream)).await?? {
         Message::ControlReady => Ok(()),
         Message::Error {
             code: ErrorCode::ControlBusy,
-        } => bail!("已有客户端正在控制该共享画面；可加 --view-only 仅观看"),
+        } => bail!("已有客户端正在控制该窗口；可加 --view-only 仅观看"),
         Message::Error {
             code: ErrorCode::ControlUnavailable,
-        } => bail!("Mac 未启用键鼠控制；请检查辅助功能权限，或加 --view-only 仅观看"),
-        _ => bail!("无法开启键鼠控制，请检查服务端日志"),
+        } => bail!("Mac 未启用鼠标控制；请检查辅助功能权限，或加 --view-only 仅观看"),
+        _ => bail!("无法开启鼠标控制，请检查 Mac 服务日志"),
     }
 }
 
@@ -588,11 +565,6 @@ mod tests {
             }
             Ok(())
         }
-        fn apply_key(&mut self, event: KeyEvent) -> Result<()> {
-            self.0
-                .store(event.down, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }
         fn release_all(&mut self) {
             self.0.store(false, std::sync::atomic::Ordering::SeqCst);
         }
@@ -653,83 +625,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keyboard_routes_down_up_and_releases_on_disconnect() {
-        use remote_protocol::KeyCode;
-        let pressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (_sender, frames) = watch::channel(None);
-        let source = PreviewSource {
-            window: WindowInfo {
-                id: 5,
-                app: "Test".into(),
-                title: "Test".into(),
-                width: 4,
-                height: 4,
-            },
-            frames,
-            demand: PreviewDemand::default(),
-            input: Some(Arc::new(TestController(pressed.clone()))),
-        };
-        let (mut client, mut server) = tokio::io::duplex(2048);
-        let host = tokio::spawn(async move { serve_with_preview(&mut server, Some(source)).await });
-        start_control(&mut client, 5).await.unwrap();
-        for down in [true, false, true] {
-            write_message(
-                &mut client,
-                &Message::Key {
-                    event: KeyEvent {
-                        frame_sequence: 0,
-                        key: KeyCode::LeftCtrl,
-                        down,
-                    },
-                },
-            )
-            .await
-            .unwrap();
-            write_message(&mut client, &Message::Ping { sequence: 1 })
-                .await
-                .unwrap();
-            assert_eq!(
-                read_message(&mut client).await.unwrap(),
-                Message::Pong { sequence: 1 }
-            );
-            assert_eq!(pressed.load(std::sync::atomic::Ordering::SeqCst), down);
-        }
-        write_message(&mut client, &Message::ReleaseKeyboard)
-            .await
-            .unwrap();
-        write_message(&mut client, &Message::Ping { sequence: 2 })
-            .await
-            .unwrap();
-        assert_eq!(
-            read_message(&mut client).await.unwrap(),
-            Message::Pong { sequence: 2 }
-        );
-        assert!(!pressed.load(std::sync::atomic::Ordering::SeqCst));
-        write_message(
-            &mut client,
-            &Message::Key {
-                event: KeyEvent {
-                    frame_sequence: 0,
-                    key: KeyCode::LeftShift,
-                    down: true,
-                },
-            },
-        )
-        .await
-        .unwrap();
-        write_message(&mut client, &Message::Ping { sequence: 3 })
-            .await
-            .unwrap();
-        assert_eq!(
-            read_message(&mut client).await.unwrap(),
-            Message::Pong { sequence: 3 }
-        );
-        drop(client);
-        assert!(host.await.unwrap().is_err());
-        assert!(!pressed.load(std::sync::atomic::Ordering::SeqCst));
-    }
-
-    #[tokio::test]
     async fn control_is_unavailable_in_view_only_session() {
         let (_sender, frames) = watch::channel(None);
         let source = PreviewSource {
@@ -751,7 +646,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("权限")
+                .contains("辅助功能")
         );
         assert!(host.await.unwrap().is_err());
     }

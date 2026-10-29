@@ -4,8 +4,6 @@ mod capture_readiness;
 mod desktop_geometry;
 #[cfg(target_os = "macos")]
 mod input_macos;
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-mod keyboard;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(any(target_os = "windows", target_os = "macos", test))]
@@ -33,7 +31,7 @@ use std::{
 use tokio::{net::TcpListener, sync::Semaphore};
 
 #[derive(Parser)]
-#[command(about = "MyRemoteApp 窗口/Windows 桌面共享与键鼠控制")]
+#[command(about = "MyRemoteApp 窗口/Windows 桌面共享与鼠标控制（键盘尚未实现）")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -77,7 +75,7 @@ enum Command {
         /// 只启动连接检查服务，不请求屏幕权限、不采集画面。
         #[arg(long)]
         check_only: bool,
-        /// 仅共享画面，不启用键鼠控制；虚拟屏模式仍需辅助功能权限来移动窗口。
+        /// 仅共享画面，不启用鼠标控制；虚拟屏模式仍需辅助功能权限来移动窗口。
         #[arg(long, conflicts_with = "check_only")]
         view_only: bool,
     },
@@ -102,7 +100,7 @@ enum Command {
         /// 收取一帧并保存为 JPEG，不打开窗口，不覆盖已有文件。
         #[arg(long)]
         save_frame: Option<PathBuf>,
-        /// 只观看画面，不建立键鼠控制连接。
+        /// 只观看画面，不建立鼠标控制连接。
         #[arg(long, conflicts_with_all = ["save_frame", "check_only"])]
         view_only: bool,
     },
