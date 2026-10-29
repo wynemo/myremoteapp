@@ -47,8 +47,8 @@ pub fn decode(frame: &PreviewFrame) -> Result<DecodedFrame> {
 async fn next_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<PreviewFrame> {
     timeout(IO_TIMEOUT, read_frame(stream))
         .await
-        .context("等待窗口画面超时")??
-        .context("Mac 窗口采集已停止；请确认 Mac 已解锁、目标窗口仍打开，再重新启动共享")
+        .context("等待共享画面超时")??
+        .context("共享画面采集已停止；请检查服务端的锁屏状态、共享目标及日志，恢复共享后重新连接")
 }
 
 // Reading must continue while JPEG decoding is busy: retain one compressed

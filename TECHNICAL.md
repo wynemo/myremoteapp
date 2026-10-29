@@ -21,6 +21,8 @@ Windows 的 `serve` 默认共享整个虚拟桌面，`serve --desktop` 可显式
 
 服务运行在当前交互用户的桌面，不是 Windows 后台系统服务。启动要求桌面已解锁；锁屏或切换至 UAC 安全桌面时停止画面和控制，不实现 Windows 远程解锁。客户端不会索取 Windows 登录密码。无需人工生成或交换证书，复制服务端导出的 `.local/host/connect.json` 即可。
 
+实验性锁屏观察：Windows 可使用 `remote-cli.exe serve --desktop --view-only --experimental-lock-screen`，客户端使用 `remote-cli connect --address HOST:9443 --view-only`。该开关仅关闭程序在截图前后对 Default 输入桌面的主动限制，实际截图仍由当前普通用户的 GDI 权限决定；服务端在桌面可访问状态变化时记录诊断，失败时记录 StretchBlt 系统错误。锁屏封面可能短暂可见，不代表能持续捕获安全登录界面；不提供键盘输入或远程解锁，不能将此实验视为权限已获得。GDI 失败仍结束当前预览；本机解锁后重新连接。默认模式保持原有锁屏暂停行为。
+
 验证边界：本机只验证 macOS 和共享模块，不安装 Windows SDK 或交叉编译工具。Windows 构建、测试及 Clippy 由 GitHub Actions 的 Windows runner 原生执行，使用 Release 模式和 `--locked`。真实 Windows 桌面的采集、多屏显示和鼠标操作仍需实机验收，不能以 CI 通过代替。
 
 API 依据：[StretchBlt](https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-stretchblt)、[SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput)、[MOUSEINPUT 虚拟桌面坐标](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-mouseinput)。

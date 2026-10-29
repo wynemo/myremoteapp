@@ -85,7 +85,11 @@ impl Drop for CaptureSession {
     }
 }
 
-pub fn start(view_only: bool) -> Result<CaptureSession> {
+pub fn start(view_only: bool, experimental_lock_screen: bool) -> Result<CaptureSession> {
+    ensure!(
+        !experimental_lock_screen || view_only,
+        "锁屏采集实验仅支持 --view-only"
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let input = Arc::new(Controller(Arc::new(Mutex::new(InputState::default()))));
     let (sender, frames) = watch::channel(None);
@@ -103,7 +107,7 @@ pub fn start(view_only: bool) -> Result<CaptureSession> {
             let initial = (|| -> Result<_> {
                 ensure!(!dpi.is_null(), "无法启用 Windows 物理像素坐标");
                 ensure!(
-                    desktop_available(),
+                    experimental_lock_screen || desktop_available(),
                     "请在已登录且解锁的 Windows 桌面启动服务"
                 );
                 desktop_rect()
@@ -121,6 +125,7 @@ pub fn start(view_only: bool) -> Result<CaptureSession> {
             }
             let mut sequence = 0;
             let mut sharing = false;
+            let mut last_desktop_available = None;
             while !stopped.load(Ordering::Acquire) {
                 if !capture_demand.is_active() {
                     if sharing {
@@ -133,15 +138,22 @@ pub fn start(view_only: bool) -> Result<CaptureSession> {
                 }
                 sharing = true;
                 let tick = Instant::now();
+                let available = desktop_available();
+                if experimental_lock_screen && last_desktop_available != Some(available) {
+                    eprintln!("锁屏采集实验：Default 输入桌面可访问={available}；继续尝试 GDI 截图。");
+                    last_desktop_available = Some(available);
+                }
                 let result = (|| -> Result<_> {
                     ensure!(
-                        desktop_available(),
+                        experimental_lock_screen || available,
                         "Windows 已锁屏或正在显示安全桌面；请在本机恢复桌面后重新连接"
                     );
                     let rect = desktop_rect()?;
-                    let frame = capture(rect, sequence)?;
+                    let frame = capture(rect, sequence).with_context(|| {
+                        format!("GDI 截图失败（Default 输入桌面可访问={available}，锁屏采集实验={experimental_lock_screen}）")
+                    })?;
                     ensure!(
-                        desktop_available(),
+                        experimental_lock_screen || desktop_available(),
                         "Windows 桌面已切换，请恢复桌面后重新连接"
                     );
                     Ok((rect, frame))
@@ -278,7 +290,8 @@ fn capture(rect: DesktopRect, sequence: u64) -> Result<PreviewFrame> {
                 // CAPTUREBLT can hide/show the software cursor on every grab.
                 SRCCOPY
             ) != 0,
-            "Windows 桌面采集失败"
+            "Windows 桌面采集失败：StretchBlt 返回 0；系统错误={}",
+            std::io::Error::last_os_error()
         );
         ensure!(GdiFlush() != 0, "Windows 桌面像素同步失败");
     }
