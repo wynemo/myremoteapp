@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, ErrorKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 pub const MAX_PASSWORD_BYTES: usize = 4096;
 pub const MAX_CONTROL_BYTES: usize = 64 * 1024;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -54,6 +54,144 @@ pub struct MouseEvent {
     pub kind: MouseAction,
 }
 
+/// Named keys; text is interpreted by the host's keyboard layout and IME.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyCode {
+    Key0,
+    Key1,
+    Key2,
+    Key3,
+    Key4,
+    Key5,
+    Key6,
+    Key7,
+    Key8,
+    Key9,
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+    G,
+    H,
+    I,
+    J,
+    K,
+    L,
+    M,
+    N,
+    O,
+    P,
+    Q,
+    R,
+    S,
+    T,
+    U,
+    V,
+    W,
+    X,
+    Y,
+    Z,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+    F13,
+    F14,
+    F15,
+    Down,
+    Left,
+    Right,
+    Up,
+    Apostrophe,
+    Backquote,
+    Backslash,
+    Comma,
+    Equal,
+    LeftBracket,
+    Minus,
+    Period,
+    RightBracket,
+    Semicolon,
+    Slash,
+    Backspace,
+    Delete,
+    End,
+    Enter,
+    Escape,
+    Home,
+    Insert,
+    Menu,
+    PageDown,
+    PageUp,
+    Pause,
+    Space,
+    Tab,
+    NumLock,
+    CapsLock,
+    ScrollLock,
+    LeftShift,
+    RightShift,
+    LeftCtrl,
+    RightCtrl,
+    NumPad0,
+    NumPad1,
+    NumPad2,
+    NumPad3,
+    NumPad4,
+    NumPad5,
+    NumPad6,
+    NumPad7,
+    NumPad8,
+    NumPad9,
+    NumPadDot,
+    NumPadSlash,
+    NumPadAsterisk,
+    NumPadMinus,
+    NumPadPlus,
+    NumPadEnter,
+    LeftAlt,
+    RightAlt,
+    LeftSuper,
+    RightSuper,
+}
+impl KeyCode {
+    pub fn is_modifier(self) -> bool {
+        matches!(
+            self,
+            Self::LeftShift
+                | Self::RightShift
+                | Self::LeftCtrl
+                | Self::RightCtrl
+                | Self::LeftAlt
+                | Self::RightAlt
+                | Self::LeftSuper
+                | Self::RightSuper
+        )
+    }
+    pub fn repeatable(self) -> bool {
+        !self.is_modifier() && !matches!(self, Self::CapsLock | Self::NumLock | Self::ScrollLock)
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyEvent {
+    pub frame_sequence: u64,
+    pub key: KeyCode,
+    pub down: bool,
+}
+
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Message {
@@ -84,6 +222,11 @@ pub enum Message {
     Mouse {
         event: MouseEvent,
     },
+    Key {
+        event: KeyEvent,
+    },
+    ReleaseMouse,
+    ReleaseKeyboard,
     ReleaseInput,
     InputError {
         message: String,
@@ -266,6 +409,50 @@ mod tests {
             Message::Ping { sequence: 42 }
         );
         assert!(reader.is_empty());
+    }
+
+    #[tokio::test]
+    async fn key_messages_preserve_modifiers_and_reject_unknown_keys() {
+        let events = [
+            Message::Key {
+                event: KeyEvent {
+                    frame_sequence: 9,
+                    key: KeyCode::LeftSuper,
+                    down: true,
+                },
+            },
+            Message::Key {
+                event: KeyEvent {
+                    frame_sequence: 9,
+                    key: KeyCode::A,
+                    down: true,
+                },
+            },
+            Message::Key {
+                event: KeyEvent {
+                    frame_sequence: 9,
+                    key: KeyCode::A,
+                    down: false,
+                },
+            },
+            Message::ReleaseKeyboard,
+        ];
+        let mut wire = Vec::new();
+        for message in &events {
+            write_message(&mut wire, message).await.unwrap();
+        }
+        let mut reader = wire.as_slice();
+        for message in events {
+            assert_eq!(read_message(&mut reader).await.unwrap(), message);
+        }
+        assert!(reader.is_empty());
+        let invalid = br#"{"type":"key","event":{"frame_sequence":1,"key":"arbitrary_scan_code","down":true}}"#;
+        let mut wire = (invalid.len() as u32).to_be_bytes().to_vec();
+        wire.extend_from_slice(invalid);
+        assert_eq!(
+            read_message(&mut wire.as_slice()).await.unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
     }
 
     #[tokio::test]

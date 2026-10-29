@@ -150,6 +150,7 @@ mod macos_image {
             width: *mut usize,
             height: *mut usize,
         ) -> bool;
+        fn remote_preview_keyboard_enabled(view: *mut c_void, enabled: bool);
         fn remote_preview_destroy(view: *mut c_void);
     }
     pub struct Renderer {
@@ -165,6 +166,11 @@ mod macos_image {
                 view,
                 last_frame: None,
             })
+        }
+        pub fn enable_keyboard(&self, enabled: bool) {
+            unsafe {
+                remote_preview_keyboard_enabled(self.view, enabled);
+            }
         }
         pub fn mouse_geometry(&self) -> (Option<(f32, f32)>, (usize, usize)) {
             let (mut x, mut y, mut width, mut height) = (0.0, 0.0, 0, 0);
@@ -216,7 +222,17 @@ fn viewer_active(window: &minifb::Window) -> bool {
         native.isKeyWindow()
     }
     #[cfg(target_os = "windows")]
-    window.is_active()
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, IsIconic, IsWindowVisible,
+        };
+        let handle = window.get_window_handle();
+        // minifb queries GetActiveWindow, which is scoped to this thread and
+        // can retain a window after its application loses foreground focus.
+        unsafe {
+            GetForegroundWindow() == handle && IsWindowVisible(handle) != 0 && IsIconic(handle) == 0
+        }
+    }
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -224,10 +240,11 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut stream: S,
     control: Option<S>,
 ) -> Result<()> {
+    use crate::keyboard::{KeyboardQueue, KeyboardTracker};
     use crate::mouse::{ControlClient, MouseSample, MouseTracker, Status};
+    use minifb::MouseButton;
     #[cfg(target_os = "windows")]
     use minifb::MouseMode;
-    use minifb::{Key, MouseButton};
     use std::{sync::Arc, time::Duration};
     use tokio::sync::watch;
     let shared = remote_session::start_preview(&mut stream).await?;
@@ -239,18 +256,34 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         None
     };
     let title = format!(
-        "{} — {}（{}，Esc 关闭）",
+        "{} — {}（{}，关闭窗口退出）",
         shared.app,
         shared.title,
         if input.is_some() {
-            "鼠标控制；键盘暂不支持"
+            "键鼠控制"
         } else {
             "仅观看"
         }
     );
     let mut window = native_window(&title, &first)?;
+    let keyboard_queue = KeyboardQueue::default();
+    if input.is_some() {
+        window.set_input_callback(Box::new(keyboard_queue.clone()));
+    }
+    #[cfg(target_os = "windows")]
+    let _keyboard_capture = if input.is_some() {
+        Some(crate::keyboard::windows_capture::Capture::attach(
+            &window,
+            keyboard_queue.clone(),
+        )?)
+    } else {
+        None
+    };
+    let mut keyboard = KeyboardTracker::default();
     #[cfg(target_os = "macos")]
     let mut renderer = macos_image::Renderer::new(&window)?;
+    #[cfg(target_os = "macos")]
+    renderer.enable_keyboard(input.is_some());
     let (sender, receiver) = watch::channel(Ok::<_, String>(first));
     let (compressed_tx, compressed_rx) = watch::channel(Ok(first_raw));
     let decoder = tokio::spawn(decode_latest_frames(compressed_rx, sender, decode));
@@ -272,7 +305,7 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let mut notice = None;
     let mut displayed_dimensions = None;
     let result = (|| -> Result<()> {
-        while window.is_open() && !window.is_key_down(Key::Escape) {
+        while window.is_open() {
             let current = receiver.borrow().clone();
             match current {
                 Ok(frame) => {
@@ -308,6 +341,12 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                 }
                             }
                         }
+                        let active = viewer_active(&window);
+                        for event in
+                            keyboard.update(keyboard_queue.drain()?, active, frame.sequence)
+                        {
+                            input.send(event)?;
+                        }
                         #[cfg(target_os = "macos")]
                         let (position, size) = renderer.mouse_geometry();
                         #[cfg(target_os = "windows")]
@@ -326,7 +365,7 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                 window.get_mouse_down(MouseButton::Middle),
                             ],
                             scroll: window.get_scroll_wheel(),
-                            active: viewer_active(&window),
+                            active,
                         }) {
                             input.send(event)?;
                         }
