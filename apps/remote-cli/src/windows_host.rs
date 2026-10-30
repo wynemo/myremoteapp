@@ -941,10 +941,12 @@ fn verify_ci_unlock(password: &[u8]) -> Result<()> {
             down,
         })
     };
+    save_ci_login_screen("before-wake")?;
     // Dismiss the clock/lock curtain; no credential has been typed yet.
     key(KeyCode::Space, true)?;
     key(KeyCode::Space, false)?;
     std::thread::sleep(Duration::from_secs(2));
+    save_ci_login_screen("after-wake")?;
     key(KeyCode::LeftCtrl, true)?;
     key(KeyCode::A, true)?;
     key(KeyCode::A, false)?;
@@ -1006,6 +1008,32 @@ fn verify_ci_unlock(password: &[u8]) -> Result<()> {
         std::thread::sleep(Duration::from_millis(100));
     }
     println!("stage=actual_unlock desktop=Default; verification=one_fixture_password_submission");
+    Ok(())
+}
+
+// Capture only BEFORE the fixture types its generated password. Never called
+// by ordinary serve/connect; these images identify the disposable login UI.
+fn save_ci_login_screen(stage: &str) -> Result<()> {
+    use std::io::Write;
+    ensure!(
+        std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+            && std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted"),
+        "CI fixture only"
+    );
+    let _desktop = DesktopBinding::open()?;
+    let frame = capture(physical_desktop_rect()?, 0)?;
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("RUNNER_TEMP").context("Missing runner temporary directory")?,
+    );
+    let path = directory.join(format!(
+        "myremoteapp-unlock-{stage}-{}.jpg",
+        std::process::id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(&frame.jpeg)?;
     Ok(())
 }
 

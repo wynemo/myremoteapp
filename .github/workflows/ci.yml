@@ -112,6 +112,15 @@ jobs:
         shell: pwsh
         run: ./scripts/test_windows_unlock.ps1 -Binary ./target/${{ matrix.target }}/release/remote-cli.exe
 
+      - name: Upload disposable login UI before fixture credential entry
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: windows-unlock-fixture-screens
+          path: ${{ runner.temp }}/myremoteapp-unlock-*.jpg
+          if-no-files-found: warn
+          retention-days: 1
+
       - name: Record Windows lock-screen experiment outcome
         if: always() && runner.os == 'Windows'
         shell: pwsh
