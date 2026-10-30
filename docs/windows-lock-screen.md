@@ -4,7 +4,24 @@
 
 当前是权限可行性实验，**尚未验证真实远程解锁**。默认 `serve` 不启用实验。普通用户模式继续只支持普通桌面。
 
+## 已完成的原生验证
+
+2026-10-30，[Windows CI run 41075508137](https://github.com/wynemo/myremoteapp/actions/runs/41075508137/job/124130484034) 在代码提交 `0988d6f` 上完成 Release / `--locked` 构建、测试和 Clippy，锁屏探测也成功。进程 PID 始终为 2556：
+
+| 实际桌面 | GDI 采集 | SYSTEM 线程身份 SendInput | 原进程身份 SendInput |
+| --- | --- | --- | --- |
+| Default | 1024×768，像素范围 0–255 | F24 松开事件接受数 1 | 接受数 1 |
+| LockWorkStation 后的 Winlogon | 1024×768，像素范围 0–255 | F24 松开事件接受数 1 | 接受数 1 |
+
+这证明本次 Windows runner 上单进程可以打开锁屏桌面、采集非纯色画面并调用输入 API。探测没有提交密码或 PIN，没有验证登录界面实际处理普通字符或完成解锁；不能把上述结果写成真实解锁验收通过。macOS 本机另已通过共享模块与 macOS Release 测试、Clippy。
+
 ## 试用步骤
+
+在 Windows 项目目录下载这次已通过 CI 的实验版（默认下载 main 分支的命令不包含此实验）：
+
+```powershell
+python download_windows.py --run-id 41075508137 --force
+```
 
 在已登录的 Windows 上打开管理员 PowerShell：
 
