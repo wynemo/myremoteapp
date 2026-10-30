@@ -862,15 +862,10 @@ fn verify_ci_unlock(password: &[u8]) -> Result<()> {
             down,
         })
     };
-    let mut tap = |code| -> Result<()> {
-        key(code, true)?;
-        key(code, false)?;
-        Ok(())
-    };
     // Dismiss the clock/lock curtain; no credential has been typed yet.
-    tap(KeyCode::Enter)?;
+    key(KeyCode::Enter, true)?;
+    key(KeyCode::Enter, false)?;
     std::thread::sleep(Duration::from_secs(2));
-    drop(tap);
     key(KeyCode::LeftCtrl, true)?;
     key(KeyCode::A, true)?;
     key(KeyCode::A, false)?;
