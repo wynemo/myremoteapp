@@ -6,8 +6,7 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hoste
 }
 $account = Get-LocalUser -Name $env:USERNAME
 if (-not $account.Enabled) { throw 'Runner account is disabled.' }
-$entropy = [byte[]]::new(16)
-[System.Security.Cryptography.RandomNumberGenerator]::Fill($entropy)
+$entropy = [System.Security.Cryptography.RandomNumberGenerator]::GetBytes(16)
 $password = 'Aa1!' + [System.Convert]::ToHexString($entropy).ToLowerInvariant()
 $secure = ConvertTo-SecureString $password -AsPlainText -Force
 # This VM is destroyed after the job. Never apply this to a personal machine.

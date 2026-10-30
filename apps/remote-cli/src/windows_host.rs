@@ -863,8 +863,8 @@ fn verify_ci_unlock(password: &[u8]) -> Result<()> {
         })
     };
     // Dismiss the clock/lock curtain; no credential has been typed yet.
-    key(KeyCode::Enter, true)?;
-    key(KeyCode::Enter, false)?;
+    key(KeyCode::Space, true)?;
+    key(KeyCode::Space, false)?;
     std::thread::sleep(Duration::from_secs(2));
     key(KeyCode::LeftCtrl, true)?;
     key(KeyCode::A, true)?;
