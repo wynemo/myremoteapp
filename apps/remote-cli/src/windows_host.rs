@@ -68,6 +68,8 @@ struct DesktopBinding {
 impl DesktopBinding {
     fn open() -> Result<Self> {
         unsafe {
+            let previous = GetThreadDesktop(GetCurrentThreadId());
+            ensure!(!previous.is_null(), "无法保存原线程桌面");
             let desktop = OpenInputDesktop(
                 0,
                 0,
@@ -78,7 +80,6 @@ impl DesktopBinding {
                 "无法访问 Windows 当前桌面：{}",
                 std::io::Error::last_os_error()
             );
-            let previous = GetThreadDesktop(GetCurrentThreadId());
             let mut binding = Self {
                 desktop,
                 previous,
@@ -103,7 +104,9 @@ impl DesktopBinding {
 impl Drop for DesktopBinding {
     fn drop(&mut self) {
         unsafe {
-            SetThreadDesktop(self.previous);
+            if SetThreadDesktop(self.previous) == 0 {
+                std::process::abort();
+            }
             CloseDesktop(self.desktop);
         }
     }
@@ -790,7 +793,11 @@ pub fn probe(lock: bool) -> Result<()> {
         };
         capture_probe().context("baseline desktop probe failed")?;
         if lock {
-            ensure!(unsafe { windows_sys::Win32::System::Shutdown::LockWorkStation() } != 0,
+            let requested = {
+                let _process_identity = crate::windows_privilege::ProcessIdentity::enter()?;
+                unsafe { windows_sys::Win32::System::Shutdown::LockWorkStation() }
+            };
+            ensure!(requested != 0,
                 "stage=lock_request failed: {}", std::io::Error::last_os_error());
             let deadline = Instant::now() + Duration::from_secs(15);
             while !current_desktop_name().is_some_and(|name| name.eq_ignore_ascii_case("Winlogon")) {
@@ -805,4 +812,29 @@ pub fn probe(lock: bool) -> Result<()> {
         println!("probe complete; no login credential was submitted; actual_unlock_verified=false");
         Ok(())
     }).join().map_err(|_| anyhow::anyhow!("Windows 探测线程异常退出"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn desktop_transition_invalidates_same_size_old_frames() {
+        let controller = Controller(Arc::new(Mutex::new(InputState::default())));
+        let rect = DesktopRect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        controller.record(1, rect, "Default".into());
+        controller.record(2, rect, "Winlogon".into());
+        let state = controller.0.lock().unwrap();
+        assert_eq!(state.frames.get(1), None);
+        assert_eq!(state.frames.get(2), Some(rect));
+        drop(state);
+        controller.record(3, rect, "Default".into());
+        let state = controller.0.lock().unwrap();
+        assert_eq!(state.frames.get(2), None);
+        assert_eq!(state.frames.get(3), Some(rect));
+    }
 }

@@ -115,9 +115,10 @@ impl ThreadIdentity {
             unsafe { GetLastError() } == ERROR_NO_TOKEN,
             "无法检查桌面线程身份"
         );
-        if system_token(process_token()?.0)? || !elevated()? {
+        if system_token(process_token()?.0)? {
             return Ok(guard);
         }
+        ensure!(elevated()?, "实验锁屏模式需要以管理员身份启动");
         // Enable SeDebugPrivilege on a private copy of this thread's token;
         // never change the shared process token's privileges.
         ensure!(
@@ -231,37 +232,6 @@ fn current_session_token() -> Result<Handle> {
     None.context("未找到当前会话的 Windows 登录进程")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // An actual Windows test, not a mocked permission check. It also runs in CI
-    // without taking over the runner's desktop or synthesizing any input.
-    #[test]
-    fn self_impersonation_is_thread_local_and_reverts() {
-        let before = effective_system();
-        std::thread::spawn(move || {
-            assert_ne!(unsafe { ImpersonateSelf(SecurityImpersonation) }, 0);
-            let identity = ThreadIdentity {
-                active: true,
-                _thread_only: PhantomData,
-            };
-            assert!(ThreadIdentity::enter().is_err());
-            assert_eq!(effective_system(), before);
-            drop(identity);
-            let mut raw = null_mut();
-            assert_eq!(
-                unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut raw) },
-                0
-            );
-            assert_eq!(unsafe { GetLastError() }, ERROR_NO_TOKEN);
-        })
-        .join()
-        .unwrap();
-        assert_eq!(effective_system(), before);
-    }
-}
-
 /// Some USER input APIs reject a caller while it is impersonating, even on the
 /// ordinary desktop. Keep the desktop handle, but run the API under the original
 /// process identity. This does not increase the process's integrity level.
@@ -306,5 +276,51 @@ impl Drop for ProcessIdentity {
         {
             std::process::abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // An actual Windows test, not a mocked permission check. It also runs in CI
+    // without taking over the runner's desktop or synthesizing any input.
+    #[test]
+    fn self_impersonation_is_thread_local_and_reverts() {
+        let before = effective_system();
+        std::thread::spawn(move || {
+            assert_ne!(unsafe { ImpersonateSelf(SecurityImpersonation) }, 0);
+            let identity = ThreadIdentity {
+                active: true,
+                _thread_only: PhantomData,
+            };
+            assert!(ThreadIdentity::enter().is_err());
+            assert_eq!(effective_system(), before);
+            {
+                let _process_identity = ProcessIdentity::enter().unwrap();
+                let mut raw = null_mut();
+                assert_eq!(
+                    unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut raw) },
+                    0
+                );
+                assert_eq!(unsafe { GetLastError() }, ERROR_NO_TOKEN);
+            }
+            let mut restored = null_mut();
+            assert_ne!(
+                unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut restored) },
+                0
+            );
+            drop(Handle::new(restored).unwrap());
+            drop(identity);
+            let mut raw = null_mut();
+            assert_eq!(
+                unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut raw) },
+                0
+            );
+            assert_eq!(unsafe { GetLastError() }, ERROR_NO_TOKEN);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(effective_system(), before);
     }
 }
