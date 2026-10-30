@@ -73,7 +73,10 @@ impl DesktopBinding {
             let desktop = OpenInputDesktop(
                 0,
                 0,
-                DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_SWITCHDESKTOP,
+                DESKTOP_READOBJECTS
+                    | DESKTOP_WRITEOBJECTS
+                    | DESKTOP_SWITCHDESKTOP
+                    | DESKTOP_JOURNALPLAYBACK,
             );
             ensure!(
                 !desktop.is_null(),
@@ -724,7 +727,6 @@ fn send_mouse(flags: u32, data: u32, x: i32, y: i32) -> Result<()> {
             },
         },
     };
-    let _process_identity = crate::windows_privilege::ProcessIdentity::enter()?;
     ensure!(
         unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1,
         "Windows 拒绝鼠标输入，请检查运行权限和系统策略"
@@ -748,7 +750,6 @@ fn send_key(key: KeyCode, down: bool) -> Result<()> {
             },
         },
     };
-    let _process_identity = crate::windows_privilege::ProcessIdentity::enter()?;
     ensure!(
         unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1,
         "Windows 拒绝键盘输入；线程模拟不保证能通过 UIPI，请查看单进程验证说明"
@@ -788,7 +789,7 @@ pub fn probe(lock: bool) -> Result<()> {
             let _process_identity = crate::windows_privilege::ProcessIdentity::enter()?;
             let accepted = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
             println!("stage=input_api identity=process key=F24 action=up accepted={accepted}; actual_unlock_verified=false");
-            ensure!(accepted == 1, "SendInput 在原管理员身份下仍拒绝输入；单进程当前桌面控制探测失败");
+            ensure!(accepted == 1 || impersonated == 1, "SendInput 在两种身份下都拒绝输入；单进程当前桌面控制探测失败");
             Ok(())
         };
         capture_probe().context("baseline desktop probe failed")?;
