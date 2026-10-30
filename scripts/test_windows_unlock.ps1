@@ -12,6 +12,23 @@ $secure = ConvertTo-SecureString $password -AsPlainText -Force
 Set-LocalUser -Name $account.Name -Password $secure
 # Test fixture only: reach a password screen without needing SAS generation.
 New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name DisableCAD -PropertyType DWord -Value 1 -Force | Out-Null
+# Make the disposable fixture enumerate its local account and the standard
+# password provider. This setup is never used on the user's Windows machine.
+$policies = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+$provider = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\{60B78E88-EAD8-445C-9CFD-0B87F74EA6CD}'
+if (-not (Test-Path $provider)) { throw 'Fixture image has no Windows password credential provider.' }
+$disabled = Get-ItemPropertyValue $provider -Name Disabled -ErrorAction SilentlyContinue
+$excluded = Get-ItemPropertyValue $policies -Name ExcludedCredentialProviders -ErrorAction SilentlyContinue
+Write-Host "Fixture password provider: registered=true; disabled=$disabled; exclusions=$excluded"
+New-ItemProperty $provider -Name Disabled -PropertyType DWord -Value 0 -Force | Out-Null
+Remove-ItemProperty $policies -Name ExcludedCredentialProviders -ErrorAction SilentlyContinue
+New-ItemProperty $policies -Name DontDisplayLastUserName -PropertyType DWord -Value 0 -Force | Out-Null
+New-ItemProperty $policies -Name DontDisplayLockedUserId -PropertyType DWord -Value 1 -Force | Out-Null
+$userList = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList'
+New-Item -Path $userList -Force | Out-Null
+$hidden = Get-ItemPropertyValue $userList -Name $account.Name -ErrorAction SilentlyContinue
+Write-Host "Fixture local account enumeration setting before setup: $hidden"
+New-ItemProperty $userList -Name $account.Name -PropertyType DWord -Value 1 -Force | Out-Null
 $pipeName = 'myremoteapp-ci-' + [System.Guid]::NewGuid().ToString('N')
 $pipe = [System.IO.Pipes.NamedPipeServerStream]::new($pipeName, [System.IO.Pipes.PipeDirection]::InOut, 1, [System.IO.Pipes.PipeTransmissionMode]::Byte, [System.IO.Pipes.PipeOptions]::Asynchronous)
 $start = [System.Diagnostics.ProcessStartInfo]::new()
