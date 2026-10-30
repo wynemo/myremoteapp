@@ -261,3 +261,50 @@ mod tests {
         assert_eq!(effective_system(), before);
     }
 }
+
+/// Some USER input APIs reject a caller while it is impersonating, even on the
+/// ordinary desktop. Keep the desktop handle, but run the API under the original
+/// process identity. This does not increase the process's integrity level.
+pub struct ProcessIdentity {
+    previous: Option<Handle>,
+    _thread_only: PhantomData<Rc<()>>,
+}
+impl ProcessIdentity {
+    pub fn enter() -> Result<Self> {
+        let mut raw = null_mut();
+        if unsafe {
+            OpenThreadToken(
+                GetCurrentThread(),
+                TOKEN_QUERY | TOKEN_IMPERSONATE,
+                1,
+                &mut raw,
+            )
+        } == 0
+        {
+            ensure!(
+                unsafe { GetLastError() } == ERROR_NO_TOKEN,
+                "无法保存输入线程身份：{}",
+                std::io::Error::last_os_error()
+            );
+            return Ok(Self {
+                previous: None,
+                _thread_only: PhantomData,
+            });
+        }
+        let token = Handle::new(raw)?;
+        ensure!(unsafe { RevertToSelf() } != 0, "无法恢复原进程身份执行输入");
+        Ok(Self {
+            previous: Some(token),
+            _thread_only: PhantomData,
+        })
+    }
+}
+impl Drop for ProcessIdentity {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous
+            && unsafe { SetThreadToken(null_mut(), previous.0) } == 0
+        {
+            std::process::abort();
+        }
+    }
+}

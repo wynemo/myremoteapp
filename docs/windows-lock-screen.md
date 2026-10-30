@@ -23,7 +23,7 @@
 - 只在专用 OS 线程执行桌面操作。网络任务通过有界通道将输入交给输入线程，不在异步运行时线程上保留模拟身份。
 - 管理员线程先 `ImpersonateSelf`，只给私有线程令牌启用 SeDebugPrivilege，避免修改进程共享令牌。查找同一会话的 winlogon，校验其令牌 SID 为 LocalSystem，再复制为受限句柄权限的模拟令牌并 `SetThreadToken`。
 - 这不是修改进程主令牌。线程模拟是否足以通过 Windows 图形子系统和 UIPI，是本次实验要验证的问题。系统策略拒绝时明确报错，不自动改用辅助进程。
-- 桌面操作用 `OpenInputDesktop` / `SetThreadDesktop`；只接受 Default，或 SYSTEM 线程上的 Winlogon。操作结束恢复原桌面并关闭句柄；线程退出 `RevertToSelf`。恢复身份失败按微软要求终止进程。
+- 桌面操作用 `OpenInputDesktop` / `SetThreadDesktop`；只接受 Default，或 SYSTEM 线程上的 Winlogon。发送输入时保留已打开的桌面句柄，临时恢复原进程身份调用 SendInput，之后恢复线程身份（第一次 Windows CI 已证实模拟状态下 SendInput 连普通桌面也返回 0）。操作结束恢复原桌面并关闭句柄；线程退出 `RevertToSelf`。恢复身份失败按微软要求终止进程。
 - 切换桌面后清除旧帧坐标，拒绝基于上一个桌面画面的输入。采集与输入失败时尝试释放按键，维持原来的独占控制和 TLS 配对。
 
 ## Windows 原生探测
@@ -34,7 +34,7 @@
 .\remote-cli.exe windows-desktop-probe --lock
 ```
 
-探测输出同一 PID、线程有效身份、桌面绑定、采集尺寸与像素范围，以及一次 F24 松开事件的 SendInput 接受数。截图仅在内存中检查，不写入或上传。不会提交任何登录凭据。SendInput 返回 1 仅代表 API 接受，**不证明登录界面处理了输入，也不证明解锁成功**。
+探测输出同一 PID、线程有效身份、桌面绑定、采集尺寸与像素范围，以及模拟身份和原进程身份各一次 F24 松开事件的 SendInput 接受数。截图仅在内存中检查，不写入或上传。不会提交任何登录凭据。SendInput 返回 1 仅代表 API 接受，**不证明登录界面处理了输入，也不证明解锁成功**。
 
 CI 在 Windows runner 原生进行 Release / `--locked` 构建、测试、Clippy；在其他 GUI 检查后运行锁屏探测。探测是允许失败的实验步骤，其结果必须单独查看，不可用整个工作流成功掩盖探测失败。macOS 本机只验证 macOS 与共享模块。
 

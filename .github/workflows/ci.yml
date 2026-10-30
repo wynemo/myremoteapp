@@ -106,10 +106,17 @@ jobs:
       # Run last among GUI operations: this may lock the ephemeral CI VM.
       # A permission denial is an experimental result, not a release-test pass.
       - name: Probe single-process Windows lock-screen access
+        id: lock_probe
         if: runner.os == 'Windows'
         continue-on-error: true
         shell: pwsh
         run: ./target/${{ matrix.target }}/release/remote-cli.exe windows-desktop-probe --lock
+
+      - name: Record Windows lock-screen experiment outcome
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "Windows single-process lock-screen probe: ${{ steps.lock_probe.outcome }}. Actual password/PIN unlock was not tested." >> $env:GITHUB_STEP_SUMMARY
 
       - name: Package and verify architecture
         id: package

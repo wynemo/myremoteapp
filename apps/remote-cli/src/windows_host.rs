@@ -721,6 +721,7 @@ fn send_mouse(flags: u32, data: u32, x: i32, y: i32) -> Result<()> {
             },
         },
     };
+    let _process_identity = crate::windows_privilege::ProcessIdentity::enter()?;
     ensure!(
         unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1,
         "Windows 拒绝鼠标输入，请检查运行权限和系统策略"
@@ -744,6 +745,7 @@ fn send_key(key: KeyCode, down: bool) -> Result<()> {
             },
         },
     };
+    let _process_identity = crate::windows_privilege::ProcessIdentity::enter()?;
     ensure!(
         unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1,
         "Windows 拒绝键盘输入；线程模拟不保证能通过 UIPI，请查看单进程验证说明"
@@ -778,9 +780,12 @@ pub fn probe(lock: bool) -> Result<()> {
                     wVk: VK_F24, wScan: 0, dwFlags: KEYEVENTF_KEYUP, time: 0, dwExtraInfo: 0,
                 } },
             };
+            let impersonated = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+            println!("stage=input_api identity=thread key=F24 action=up accepted={impersonated}");
+            let _process_identity = crate::windows_privilege::ProcessIdentity::enter()?;
             let accepted = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
-            println!("stage=input_api key=F24 action=up accepted={accepted}; this_does_not_prove_unlock=true");
-            ensure!(accepted == 1, "SendInput 拒绝输入；不能证明单进程可控制当前桌面");
+            println!("stage=input_api identity=process key=F24 action=up accepted={accepted}; actual_unlock_verified=false");
+            ensure!(accepted == 1, "SendInput 在原管理员身份下仍拒绝输入；单进程当前桌面控制探测失败");
             Ok(())
         };
         capture_probe().context("baseline desktop probe failed")?;
