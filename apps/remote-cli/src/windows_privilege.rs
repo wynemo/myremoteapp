@@ -253,6 +253,8 @@ pub fn restart_as_system() -> Result<bool> {
     let pid = std::thread::spawn(|| -> Result<u32> {
         let _identity = ThreadIdentity::enter()?;
         let primary = current_session_token(true)?;
+        enable_thread_privilege("SeAssignPrimaryTokenPrivilege")?;
+        enable_thread_privilege("SeIncreaseQuotaPrivilege")?;
         let executable = std::env::current_exe()?;
         let mut arguments = vec![executable.as_os_str().to_owned()];
         arguments.extend(std::env::args_os().skip(1));
@@ -272,11 +274,13 @@ pub fn restart_as_system() -> Result<bool> {
         let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
         ensure!(
             unsafe {
-                CreateProcessWithTokenW(
+                CreateProcessAsUserW(
                     primary.0,
-                    0,
                     wide(&executable).as_ptr(),
                     command.as_mut_ptr(),
+                    null_mut(),
+                    null_mut(),
+                    0,
                     CREATE_NEW_CONSOLE | CREATE_SUSPENDED,
                     null_mut(),
                     directory.as_ptr(),
@@ -304,6 +308,43 @@ pub fn restart_as_system() -> Result<bool> {
     );
     Ok(true)
 }
+fn enable_thread_privilege(name: &str) -> Result<()> {
+    let mut raw = null_mut();
+    ensure!(
+        unsafe {
+            OpenThreadToken(
+                GetCurrentThread(),
+                TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+                0,
+                &mut raw,
+            )
+        } != 0,
+        "Unable to open SYSTEM launch token: {}",
+        std::io::Error::last_os_error()
+    );
+    let token = Handle::new(raw)?;
+    let mut privilege: TOKEN_PRIVILEGES = unsafe { std::mem::zeroed() };
+    privilege.PrivilegeCount = 1;
+    ensure!(
+        unsafe {
+            LookupPrivilegeValueW(
+                null_mut(),
+                wide(name).as_ptr(),
+                &mut privilege.Privileges[0].Luid,
+            )
+        } != 0,
+        "Unable to find launch privilege"
+    );
+    privilege.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    ensure!(
+        unsafe { AdjustTokenPrivileges(token.0, 0, &privilege, 0, null_mut(), null_mut()) } != 0
+            && unsafe { GetLastError() } != ERROR_NOT_ALL_ASSIGNED,
+        "SYSTEM launch privilege unavailable: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok(())
+}
+
 fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
 }
