@@ -24,8 +24,8 @@ use windows_sys::Win32::{
         HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext},
         Input::KeyboardAndMouse::*,
         WindowsAndMessaging::{
-            GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-            SM_YVIRTUALSCREEN, WHEEL_DELTA,
+            GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId, SM_CXVIRTUALSCREEN,
+            SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WHEEL_DELTA,
         },
     },
 };
@@ -320,10 +320,11 @@ impl InputController for ThreadController {
                     } else {
                         None
                     };
+                    let desktop = DesktopBinding::open()?;
                     let session = controller.acquire()?;
-                    Ok((identity, session))
+                    Ok((identity, desktop, session))
                 })();
-                let (_identity, mut session) = match setup {
+                let (_identity, desktop, mut session) = match setup {
                     Ok(value) => value,
                     Err(error) => {
                         let _ = initialized.send(Err(format!("{error:#}")));
@@ -333,27 +334,39 @@ impl InputController for ThreadController {
                 if initialized.send(Ok(())).is_err() {
                     return;
                 }
+                // Keep the input queue attached between keydown/keyup events.
+                // Rebind only when the active desktop actually changes.
+                let mut desktop = Some(desktop);
                 while let Ok((command, reply)) = receiver.recv() {
-                    let result = match command {
-                        InputCommand::Mouse(event) => session.apply(event),
-                        InputCommand::Key(event) => session.apply_key(event),
-                        InputCommand::ReleaseMouse => {
-                            session.release_mouse();
-                            Ok(())
+                    let result = (|| -> Result<()> {
+                        let current =
+                            current_desktop_name().context("Windows 当前输入桌面不可访问")?;
+                        if desktop.as_ref().is_none_or(|bound| bound.name != current) {
+                            desktop.take();
+                            desktop = Some(DesktopBinding::open()?);
                         }
-                        InputCommand::ReleaseKeyboard => {
-                            session.release_keyboard();
-                            Ok(())
+                        match command {
+                            InputCommand::Mouse(event) => session.apply(event),
+                            InputCommand::Key(event) => session.apply_key(event),
+                            InputCommand::ReleaseMouse => {
+                                session.release_mouse();
+                                Ok(())
+                            }
+                            InputCommand::ReleaseKeyboard => {
+                                session.release_keyboard();
+                                Ok(())
+                            }
+                            InputCommand::ReleaseAll => {
+                                session.release_all();
+                                Ok(())
+                            }
                         }
-                        InputCommand::ReleaseAll => {
-                            session.release_all();
-                            Ok(())
-                        }
-                    };
+                    })();
                     let _ = reply.send(result);
                 }
                 // session releases all held input before the impersonation ends.
                 drop(session);
+                drop(desktop);
             })
             .context("无法启动 Windows 输入线程")?;
         let session = ThreadSession {
@@ -736,18 +749,10 @@ fn send_mouse(flags: u32, data: u32, x: i32, y: i32) -> Result<()> {
 
 fn send_key(key: KeyCode, down: bool) -> Result<()> {
     let _desktop = DesktopBinding::open()?;
-    let (virtual_key, extended) = crate::keyboard::windows_key(key);
     let input = INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: virtual_key,
-                wScan: 0,
-                dwFlags: if extended { KEYEVENTF_EXTENDEDKEY } else { 0 }
-                    | if down { 0 } else { KEYEVENTF_KEYUP },
-                time: 0,
-                dwExtraInfo: 0,
-            },
+            ki: keyboard_input(key, down),
         },
     };
     ensure!(
@@ -755,6 +760,34 @@ fn send_key(key: KeyCode, down: bool) -> Result<()> {
         "Windows 拒绝键盘输入；线程模拟不保证能通过 UIPI，请查看单进程验证说明"
     );
     Ok(())
+}
+
+fn keyboard_input(key: KeyCode, down: bool) -> KEYBDINPUT {
+    let (virtual_key, extended) = crate::keyboard::windows_key(key);
+    let foreground = unsafe { GetForegroundWindow() };
+    let thread = if foreground.is_null() {
+        0
+    } else {
+        unsafe { GetWindowThreadProcessId(foreground, null_mut()) }
+    };
+    let layout = unsafe { GetKeyboardLayout(thread) };
+    let scan = unsafe { MapVirtualKeyExW(u32::from(virtual_key), MAPVK_VK_TO_VSC_EX, layout) };
+    // Pause uses an E1 multi-byte sequence; retain the virtual-key fallback for
+    // this special key and unmapped keys. Ordinary keys use physical scan codes.
+    let physical = scan != 0 && scan >> 8 != 0xe1 && key != KeyCode::Pause;
+    KEYBDINPUT {
+        wVk: if physical { 0 } else { virtual_key },
+        wScan: if physical { (scan & 0xff) as u16 } else { 0 },
+        dwFlags: if physical { KEYEVENTF_SCANCODE } else { 0 }
+            | if extended || scan >> 8 == 0xe0 {
+                KEYEVENTF_EXTENDEDKEY
+            } else {
+                0
+            }
+            | if down { 0 } else { KEYEVENTF_KEYUP },
+        time: 0,
+        dwExtraInfo: 0,
+    }
 }
 
 /// Native proof-of-concept. Does not read or submit credentials. A successful
@@ -933,6 +966,23 @@ fn verify_ci_unlock(password: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn physical_keys_keep_extended_and_release_flags() {
+        for (key, scan, extended) in [
+            (KeyCode::Enter, 0x1c, false),
+            (KeyCode::NumPadEnter, 0x1c, true),
+            (KeyCode::RightCtrl, 0x1d, true),
+            (KeyCode::LeftShift, 0x2a, false),
+        ] {
+            let down = keyboard_input(key, true);
+            let up = keyboard_input(key, false);
+            assert_eq!(down.wVk, 0);
+            assert_eq!(down.wScan, scan);
+            assert_ne!(down.dwFlags & KEYEVENTF_SCANCODE, 0);
+            assert_eq!(down.dwFlags & KEYEVENTF_EXTENDEDKEY != 0, extended);
+            assert_eq!(up.dwFlags, down.dwFlags | KEYEVENTF_KEYUP);
+        }
+    }
     #[test]
     fn desktop_transition_invalidates_same_size_old_frames() {
         let controller = Controller(Arc::new(Mutex::new(InputState::default())));
