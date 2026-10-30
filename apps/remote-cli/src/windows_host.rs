@@ -1017,7 +1017,6 @@ fn prepare_ci_password_field() -> Result<()> {
     unsafe extern "C" {
         fn remote_ci_prepare_password_field(path: *const u16) -> i32;
     }
-    let _desktop = DesktopBinding::open()?;
     let directory = std::path::PathBuf::from(
         std::env::var_os("RUNNER_TEMP").context("Missing runner temporary directory")?,
     );
@@ -1026,7 +1025,35 @@ fn prepare_ci_password_field() -> Result<()> {
         std::process::id()
     ));
     let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let result = unsafe { remote_ci_prepare_password_field(path.as_ptr()) };
+    // UIA may create hidden windows. Let its dedicated OS thread exit before
+    // closing the desktop, instead of trying to rebind a thread with windows.
+    let (result, desktop) = std::thread::spawn(move || -> Result<(i32, usize)> {
+        let desktop = unsafe {
+            OpenInputDesktop(
+                0,
+                0,
+                DESKTOP_READOBJECTS
+                    | DESKTOP_WRITEOBJECTS
+                    | DESKTOP_SWITCHDESKTOP
+                    | DESKTOP_CREATEWINDOW
+                    | DESKTOP_JOURNALPLAYBACK,
+            )
+        };
+        ensure!(!desktop.is_null(), "Unable to open CI login desktop");
+        if unsafe { SetThreadDesktop(desktop) } == 0 {
+            unsafe {
+                CloseDesktop(desktop);
+            }
+            anyhow::bail!("Unable to bind CI login desktop");
+        }
+        let result = unsafe { remote_ci_prepare_password_field(path.as_ptr()) };
+        Ok((result, desktop as usize))
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("CI login UI thread exited unexpectedly"))??;
+    unsafe {
+        CloseDesktop(desktop as HDESK);
+    }
     ensure!(
         result >= 0,
         "CI password field is not available/focused: HRESULT={result:#x}; no password was submitted"
