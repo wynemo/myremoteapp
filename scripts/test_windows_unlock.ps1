@@ -11,6 +11,10 @@ $password = 'Aa1!' + [System.Convert]::ToHexString($entropy).ToLowerInvariant()
 $secure = ConvertTo-SecureString $password -AsPlainText -Force
 # This VM is destroyed after the job. Never apply this to a personal machine.
 Set-LocalUser -Name $account.Name -Password $secure
+# Secure-attention generation is outside the product's supported scope. Configure
+# only the disposable fixture so this test reaches the same password screen as
+# a user who does not require Ctrl+Alt+Del. Product startup never changes policy.
+New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name DisableCAD -PropertyType DWord -Value 1 -Force | Out-Null
 $start = [System.Diagnostics.ProcessStartInfo]::new()
 $start.FileName = (Resolve-Path $Binary).Path
 $start.UseShellExecute = $false

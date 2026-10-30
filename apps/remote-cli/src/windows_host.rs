@@ -822,6 +822,7 @@ pub fn probe(lock: bool, ci_unlock: bool) -> Result<()> {
         let capture_probe = || -> Result<()> {
             let binding = DesktopBinding::open().context("stage=desktop_binding")?;
             println!("stage=desktop_binding desktop={}", binding.name);
+            println!("stage=input_context {}", crate::windows_privilege::input_context().unwrap_or_else(|_| "unavailable".into()));
             let rect = physical_desktop_rect()?;
             let frame = capture(rect, 0).context("stage=capture")?;
             // Decode only in memory. Never upload a login-screen screenshot.

@@ -279,6 +279,59 @@ impl Drop for ProcessIdentity {
     }
 }
 
+/// Metadata only: never inspect window titles, text fields, or input values.
+pub fn input_context() -> Result<String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId,
+    };
+    fn label(token: HANDLE) -> Result<&'static str> {
+        let mut data = [0usize; 64];
+        let mut length = 0;
+        ensure!(
+            unsafe {
+                GetTokenInformation(
+                    token,
+                    TokenIntegrityLevel,
+                    data.as_mut_ptr().cast(),
+                    size_of_val(&data) as u32,
+                    &mut length,
+                )
+            } != 0,
+            "无法读取输入完整性级别"
+        );
+        let sid = unsafe { (*data.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()).Label.Sid };
+        for (kind, name) in [
+            (WinSystemLabelSid, "system"),
+            (WinHighLabelSid, "high"),
+            (WinMediumLabelSid, "medium"),
+            (WinLowLabelSid, "low"),
+        ] {
+            if unsafe { IsWellKnownSid(sid, kind) } != 0 {
+                return Ok(name);
+            }
+        }
+        Ok("other")
+    }
+    let own = process_token()?;
+    let mut pid = 0;
+    unsafe {
+        GetWindowThreadProcessId(GetForegroundWindow(), &mut pid);
+    }
+    let target = Handle::new(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })?;
+    let mut raw = null_mut();
+    ensure!(
+        unsafe { OpenProcessToken(target.0, TOKEN_QUERY, &mut raw) } != 0,
+        "无法读取前台输入目标身份"
+    );
+    let target = Handle::new(raw)?;
+    Ok(format!(
+        "process_integrity={} foreground_integrity={} thread_system={}",
+        label(own.0)?,
+        label(target.0)?,
+        effective_system()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
