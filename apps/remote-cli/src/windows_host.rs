@@ -813,6 +813,7 @@ pub fn probe(lock: bool, ci_unlock: bool) -> Result<()> {
     } else {
         None
     };
+    crate::windows_privilege::prepare_input_integrity().context("stage=process_integrity")?;
     let process_id = std::process::id();
     println!("single-process probe: pid={process_id}; lock={lock}");
     std::thread::spawn(move || -> Result<()> {

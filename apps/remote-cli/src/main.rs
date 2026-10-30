@@ -235,6 +235,10 @@ async fn main() -> Result<()> {
                 window_id.is_none() && !virtual_display,
                 "Windows 服务端共享整个桌面，不支持 --window-id 或 --virtual-display"
             );
+            #[cfg(target_os = "windows")]
+            if experimental_lock_screen {
+                windows_privilege::prepare_input_integrity()?;
+            }
             let listener = TcpListener::bind(&listen).await?;
             #[cfg(target_os = "macos")]
             let mut capture = if check_only {

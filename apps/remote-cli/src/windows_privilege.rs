@@ -279,6 +279,88 @@ impl Drop for ProcessIdentity {
     }
 }
 
+/// UIPI tags injected input with the process integrity, not just the worker's
+/// impersonation identity. Change only this process's label before USER/GDI
+/// initialization. The process SID stays the launching administrator's SID.
+pub fn prepare_input_integrity() -> Result<()> {
+    std::thread::spawn(|| -> Result<()> {
+        let _identity = ThreadIdentity::enter()?;
+        let mut effective = null_mut();
+        ensure!(
+            unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 0, &mut effective) } != 0,
+            "无法读取锁屏线程完整性身份"
+        );
+        let effective = Handle::new(effective)?;
+        let mut data = [0usize; 64];
+        let mut length = 0;
+        ensure!(
+            unsafe {
+                GetTokenInformation(
+                    effective.0,
+                    TokenIntegrityLevel,
+                    data.as_mut_ptr().cast(),
+                    size_of_val(&data) as u32,
+                    &mut length,
+                )
+            } != 0,
+            "无法读取 SYSTEM 完整性级别"
+        );
+        let label = unsafe { &*data.as_ptr().cast::<TOKEN_MANDATORY_LABEL>() };
+        ensure!(
+            unsafe { IsWellKnownSid(label.Label.Sid, WinSystemLabelSid) } != 0,
+            "锁屏线程令牌没有 SYSTEM 完整性级别"
+        );
+        let mut raw = null_mut();
+        ensure!(
+            unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_QUERY | TOKEN_ADJUST_DEFAULT,
+                    &mut raw,
+                )
+            } != 0,
+            "无法打开当前程序的完整性配置：{}",
+            std::io::Error::last_os_error()
+        );
+        let own = Handle::new(raw)?;
+        ensure!(
+            unsafe {
+                SetTokenInformation(own.0, TokenIntegrityLevel, data.as_ptr().cast(), length)
+            } != 0,
+            "系统拒绝调整当前程序的输入完整性级别，无法控制锁屏：{}",
+            std::io::Error::last_os_error()
+        );
+        let mut verified = [0usize; 64];
+        ensure!(
+            unsafe {
+                GetTokenInformation(
+                    own.0,
+                    TokenIntegrityLevel,
+                    verified.as_mut_ptr().cast(),
+                    size_of_val(&verified) as u32,
+                    &mut length,
+                )
+            } != 0,
+            "无法验证当前程序的完整性级别"
+        );
+        let sid = unsafe {
+            (*verified.as_ptr().cast::<TOKEN_MANDATORY_LABEL>())
+                .Label
+                .Sid
+        };
+        ensure!(
+            unsafe { IsWellKnownSid(sid, WinSystemLabelSid) } != 0,
+            "当前程序的输入完整性级别验证失败"
+        );
+        println!(
+            "stage=process_integrity level=system; same_process=true; service_installed=false"
+        );
+        Ok(())
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("输入完整性初始化线程异常退出"))?
+}
+
 /// Metadata only: never inspect window titles, text fields, or input values.
 pub fn input_context() -> Result<String> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
