@@ -17,18 +17,26 @@ New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies
 $policies = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
 $provider = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\{60B78E88-EAD8-445C-9CFD-0B87F74EA6CD}'
 if (-not (Test-Path $provider)) { throw 'Fixture image has no Windows password credential provider.' }
-$disabled = Get-ItemPropertyValue $provider -Name Disabled -ErrorAction SilentlyContinue
-$excluded = Get-ItemPropertyValue $policies -Name ExcludedCredentialProviders -ErrorAction SilentlyContinue
+$disabled = (Get-Item $provider).GetValue('Disabled', $null)
+$excluded = (Get-Item $policies).GetValue('ExcludedCredentialProviders', $null)
 Write-Host "Fixture password provider: registered=true; disabled=$disabled; exclusions=$excluded"
 New-ItemProperty $provider -Name Disabled -PropertyType DWord -Value 0 -Force | Out-Null
-Remove-ItemProperty $policies -Name ExcludedCredentialProviders -ErrorAction SilentlyContinue
+if ($null -ne $excluded) { Remove-ItemProperty $policies -Name ExcludedCredentialProviders }
 New-ItemProperty $policies -Name DontDisplayLastUserName -PropertyType DWord -Value 0 -Force | Out-Null
 New-ItemProperty $policies -Name DontDisplayLockedUserId -PropertyType DWord -Value 1 -Force | Out-Null
 $userList = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList'
 New-Item -Path $userList -Force | Out-Null
-$hidden = Get-ItemPropertyValue $userList -Name $account.Name -ErrorAction SilentlyContinue
+$hidden = (Get-Item $userList).GetValue($account.Name, $null)
 Write-Host "Fixture local account enumeration setting before setup: $hidden"
 New-ItemProperty $userList -Name $account.Name -PropertyType DWord -Value 1 -Force | Out-Null
+# Turn off auto-logon in the disposable fixture; cached auto-logon credentials
+# must not suppress the password provider after resetting its test password.
+$logon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+foreach ($name in @('AutoAdminLogon', 'ForceAutoLogon')) {
+    $value = (Get-Item $logon).GetValue($name, $null)
+    Write-Host "Fixture $name before setup: $value"
+    New-ItemProperty $logon -Name $name -PropertyType String -Value '0' -Force | Out-Null
+}
 $pipeName = 'myremoteapp-ci-' + [System.Guid]::NewGuid().ToString('N')
 $pipe = [System.IO.Pipes.NamedPipeServerStream]::new($pipeName, [System.IO.Pipes.PipeDirection]::InOut, 1, [System.IO.Pipes.PipeTransmissionMode]::Byte, [System.IO.Pipes.PipeOptions]::Asynchronous)
 $start = [System.Diagnostics.ProcessStartInfo]::new()
