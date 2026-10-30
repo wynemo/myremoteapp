@@ -19,7 +19,9 @@ Windows 的 `serve` 默认共享整个虚拟桌面，`serve --desktop` 可显式
 
 复用现有持久配对、双向 TLS、SOCKS5、独立控制连接及会话心跳。SendInput 使用 ABSOLUTE / VIRTUALDESK 将客户端归一化坐标映射到完整桌面。保留最近 32 帧的物理桌面边界，显示器布局变化后拒绝旧帧操作；采集暂停、连接结束及服务关闭时尝试释放按键。仅一个客户端可取得键鼠控制。输入受 Windows UIPI 权限限制，不能控制权限更高的程序。
 
-服务运行在当前交互会话，不注册 Windows 系统服务、不启动辅助进程、不设置计划任务或开机启动。默认模式启动要求桌面已解锁；锁屏或切换至 UAC 安全桌面时停止画面和控制。新增 `serve --experimental-lock-screen` 单进程实验，仅管理员启用后在专用采集/输入线程模拟当前会话的 SYSTEM 身份，并尝试绑定当前输入桌面；线程退出恢复身份，网络线程不模拟。真实密码提交测试已失败，当前不能据此远程解锁；日志显示进程为 high 完整性、登录界面为 system 完整性，线程模拟没有改变进程完整性。运行中提升进程完整性的尝试被 Windows 以错误 1375 拒绝，已撤回。桌面访问和 SendInput 返回成功不能证明密码框接收了输入。完整验证流程见 [Windows 锁屏实验](docs/windows-lock-screen.md)。客户端终端不会索取 Windows 登录密码；若实机验证可用，密码或 PIN 由用户在远程登录画面中手动输入，程序不保存。无需人工生成或交换证书，复制服务端导出的 `.local/host/connect.json` 即可。
+服务运行在当前交互会话，不注册 Windows 系统服务，不保留常驻辅助进程，不设置计划任务或开机启动。默认模式遇到锁屏或 UAC 安全桌面停止画面和控制。`serve --experimental-lock-screen` 需要管理员启动：通过当前会话的 SYSTEM 主令牌与 CreateProcessAsUserW 重新启动相同 EXE，保留原参数和工作目录，原进程立即退出。仅启动瞬间有两个 PID，随后只保留 SYSTEM 替代进程；在其新窗口按 Ctrl+C 停止。此启动方式已得到用户明确授权。
+
+此前线程模拟版的进程完整性仍为 high，不能将桌面访问或 SendInput 接受等同于密码框可输入；运行中提高进程完整性也被 Windows 以错误 1375 拒绝。现采用 SYSTEM 主令牌启动，输入线程持续绑定当前桌面，桌面切换时重绑并丢弃旧帧。按键优先按前台布局映射为物理扫描码，保留扩展键与松开标志。Windows CI 已通过原进程退出、锁屏、实际输入一次临时密码并恢复 Default 桌面的完整验证；证据和限制见 [Windows 锁屏说明](docs/windows-lock-screen.md)。客户端终端不索取 Windows 密码；密码在远程画面中手动输入，不保存、不自动重试。PIN、Ctrl+Alt+Del 登录策略及不同 Windows 版本实机兼容性尚未涵盖。身份和 TLS 配置仍由程序处理，复制 `.local/host/connect.json` 即可。
 
 验证边界：本机只验证 macOS 和共享模块，不安装 Windows SDK 或交叉编译工具。Windows 构建、测试及 Clippy 由 GitHub Actions 的 Windows runner 原生执行，使用 Release 模式和 `--locked`。真实 Windows 桌面的采集、多屏显示和鼠标操作仍需实机验收，不能以 CI 通过代替。
 

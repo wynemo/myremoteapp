@@ -104,11 +104,10 @@ jobs:
           python scripts/smoke_viewer.py "${args[@]}"
 
       # Run last among GUI operations: this may lock the ephemeral CI VM.
-      # A permission denial is an experimental result, not a release-test pass.
-      - name: Probe single-process Windows lock-screen access
+      # Require real password submission to restore the original desktop.
+      - name: Test Windows lock-screen password input
         id: lock_probe
         if: runner.os == 'Windows'
-        continue-on-error: true
         shell: pwsh
         run: ./scripts/test_windows_unlock.ps1 -Binary ./target/${{ matrix.target }}/release/remote-cli.exe
 
