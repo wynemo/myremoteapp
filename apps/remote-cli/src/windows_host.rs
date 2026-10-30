@@ -947,6 +947,7 @@ fn verify_ci_unlock(password: &[u8]) -> Result<()> {
     key(KeyCode::Space, false)?;
     std::thread::sleep(Duration::from_secs(2));
     save_ci_login_screen("after-wake")?;
+    prepare_ci_password_field()?;
     key(KeyCode::LeftCtrl, true)?;
     key(KeyCode::A, true)?;
     key(KeyCode::A, false)?;
@@ -1008,6 +1009,28 @@ fn verify_ci_unlock(password: &[u8]) -> Result<()> {
         std::thread::sleep(Duration::from_millis(100));
     }
     println!("stage=actual_unlock desktop=Default; verification=one_fixture_password_submission");
+    Ok(())
+}
+
+fn prepare_ci_password_field() -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn remote_ci_prepare_password_field(path: *const u16) -> i32;
+    }
+    let _desktop = DesktopBinding::open()?;
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("RUNNER_TEMP").context("Missing runner temporary directory")?,
+    );
+    let path = directory.join(format!(
+        "myremoteapp-unlock-controls-{}.txt",
+        std::process::id()
+    ));
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let result = unsafe { remote_ci_prepare_password_field(path.as_ptr()) };
+    ensure!(
+        result >= 0,
+        "CI password field is not available/focused: HRESULT={result:#x}; no password was submitted"
+    );
     Ok(())
 }
 
