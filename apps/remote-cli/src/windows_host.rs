@@ -759,7 +759,27 @@ fn send_key(key: KeyCode, down: bool) -> Result<()> {
 
 /// Native proof-of-concept. Does not read or submit credentials. A successful
 /// SendInput call is only API acceptance, not proof that LogonUI handled it.
-pub fn probe(lock: bool) -> Result<()> {
+pub fn probe(lock: bool, ci_unlock: bool) -> Result<()> {
+    let password = if ci_unlock {
+        ensure!(
+            std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+                && std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted"),
+            "真实解锁探测仅允许在一次性 GitHub-hosted runner 运行"
+        );
+        use std::io::Read;
+        let mut bytes = zeroize::Zeroizing::new(Vec::new());
+        std::io::stdin().take(129).read_to_end(&mut bytes)?;
+        ensure!(
+            (4..=128).contains(&bytes.len())
+                && bytes
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || *b == b'!'),
+            "无效的临时测试凭据"
+        );
+        Some(bytes)
+    } else {
+        None
+    };
     let process_id = std::process::id();
     println!("single-process probe: pid={process_id}; lock={lock}");
     std::thread::spawn(move || -> Result<()> {
@@ -810,9 +830,109 @@ pub fn probe(lock: bool) -> Result<()> {
             capture_probe().context("locked desktop probe failed")?;
         }
         ensure!(std::process::id() == process_id, "探测进程发生变化");
-        println!("probe complete; no login credential was submitted; actual_unlock_verified=false");
+        if let Some(password) = password {
+            verify_ci_unlock(&password)?;
+            println!("probe complete; actual_unlock_verified=true; fixture_credential_submitted_once=true");
+        } else {
+            println!("probe complete; no login credential was submitted; actual_unlock_verified=false");
+        }
         Ok(())
     }).join().map_err(|_| anyhow::anyhow!("Windows 探测线程异常退出"))?
+}
+
+// Exercises the actual dedicated input worker and frame checks. Only the CI
+// fixture supplies a newly generated password over stdin; it is never logged.
+fn verify_ci_unlock(password: &[u8]) -> Result<()> {
+    ensure!(
+        current_desktop_name().as_deref() == Some("Winlogon"),
+        "解锁验收要求当前确实处于 Winlogon 桌面"
+    );
+    let controller = Arc::new(Controller(Arc::new(Mutex::new(InputState::default()))));
+    let rect = physical_desktop_rect()?;
+    controller.record(1, rect, "Winlogon".into());
+    let mut input = ThreadController {
+        controller,
+        experimental_lock_screen: true,
+    }
+    .acquire()?;
+    let mut key = |code, down| {
+        input.apply_key(KeyEvent {
+            frame_sequence: 1,
+            key: code,
+            down,
+        })
+    };
+    let mut tap = |code| -> Result<()> {
+        key(code, true)?;
+        key(code, false)?;
+        Ok(())
+    };
+    // Dismiss the clock/lock curtain; no credential has been typed yet.
+    tap(KeyCode::Enter)?;
+    std::thread::sleep(Duration::from_secs(2));
+    drop(tap);
+    key(KeyCode::LeftCtrl, true)?;
+    key(KeyCode::A, true)?;
+    key(KeyCode::A, false)?;
+    key(KeyCode::LeftCtrl, false)?;
+    key(KeyCode::Backspace, true)?;
+    key(KeyCode::Backspace, false)?;
+    if unsafe { GetKeyState(VK_CAPITAL as i32) } & 1 != 0 {
+        key(KeyCode::CapsLock, true)?;
+        key(KeyCode::CapsLock, false)?;
+    }
+    for byte in password {
+        let (code, shift) = match byte {
+            b'a' => (KeyCode::A, false),
+            b'A' => (KeyCode::A, true),
+            b'b' => (KeyCode::B, false),
+            b'B' => (KeyCode::B, true),
+            b'c' => (KeyCode::C, false),
+            b'C' => (KeyCode::C, true),
+            b'd' => (KeyCode::D, false),
+            b'D' => (KeyCode::D, true),
+            b'e' => (KeyCode::E, false),
+            b'E' => (KeyCode::E, true),
+            b'f' => (KeyCode::F, false),
+            b'F' => (KeyCode::F, true),
+            b'0' => (KeyCode::Key0, false),
+            b'1' => (KeyCode::Key1, false),
+            b'2' => (KeyCode::Key2, false),
+            b'3' => (KeyCode::Key3, false),
+            b'4' => (KeyCode::Key4, false),
+            b'5' => (KeyCode::Key5, false),
+            b'6' => (KeyCode::Key6, false),
+            b'7' => (KeyCode::Key7, false),
+            b'8' => (KeyCode::Key8, false),
+            b'9' => (KeyCode::Key9, false),
+            b'!' => (KeyCode::Key1, true),
+            _ => anyhow::bail!("临时测试凭据包含不支持的字符"),
+        };
+        if shift {
+            key(KeyCode::LeftShift, true)?;
+        }
+        key(code, true)?;
+        key(code, false)?;
+        if shift {
+            key(KeyCode::LeftShift, false)?;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    // Exactly one submission; a failure does not retry the fixture password.
+    key(KeyCode::Enter, true)?;
+    key(KeyCode::Enter, false)?;
+    input.release_all();
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while current_desktop_name().as_deref() != Some("Default") {
+        ensure!(
+            Instant::now() < deadline,
+            "actual_unlock_verified=false：临时密码只提交了一次，登录界面未解锁；API 接受不等于输入生效"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    println!("stage=actual_unlock desktop=Default; verification=one_fixture_password_submission");
+    Ok(())
 }
 
 #[cfg(test)]

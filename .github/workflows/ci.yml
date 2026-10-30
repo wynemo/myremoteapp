@@ -110,13 +110,13 @@ jobs:
         if: runner.os == 'Windows'
         continue-on-error: true
         shell: pwsh
-        run: ./target/${{ matrix.target }}/release/remote-cli.exe windows-desktop-probe --lock
+        run: ./scripts/test_windows_unlock.ps1 -Binary ./target/${{ matrix.target }}/release/remote-cli.exe
 
       - name: Record Windows lock-screen experiment outcome
         if: always() && runner.os == 'Windows'
         shell: pwsh
         run: |
-          "Windows single-process lock-screen probe: ${{ steps.lock_probe.outcome }}. Actual password/PIN unlock was not tested." >> $env:GITHUB_STEP_SUMMARY
+          "Windows single-process lock-screen probe: ${{ steps.lock_probe.outcome }}. See probe logs for actual_unlock_verified; API acceptance alone does not prove unlock." >> $env:GITHUB_STEP_SUMMARY
 
       - name: Package and verify architecture
         id: package

@@ -49,6 +49,9 @@ enum Command {
     WindowsDesktopProbe {
         #[arg(long)]
         lock: bool,
+        /// 仅限一次性 GitHub runner：从标准输入读取临时测试密码并提交一次。
+        #[arg(long, requires = "lock", hide = true)]
+        ci_unlock: bool,
     },
     /// 只读检查共享窗口的点击命中信息，不发送事件。
     #[cfg(target_os = "macos")]
@@ -125,7 +128,7 @@ enum Command {
 async fn main() -> Result<()> {
     match Cli::parse().command {
         #[cfg(target_os = "windows")]
-        Command::WindowsDesktopProbe { lock } => windows_host::probe(lock)?,
+        Command::WindowsDesktopProbe { lock, ci_unlock } => windows_host::probe(lock, ci_unlock)?,
         #[cfg(target_os = "macos")]
         Command::InputDiagnostics {
             window_id,
