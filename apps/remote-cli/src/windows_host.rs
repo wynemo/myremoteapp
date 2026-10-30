@@ -19,7 +19,7 @@ use std::{
 use tokio::sync::watch;
 use windows_sys::Win32::{
     Graphics::Gdi::*,
-    System::StationsAndDesktops::*,
+    System::{StationsAndDesktops::*, Threading::GetCurrentThreadId},
     UI::{
         HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext},
         Input::KeyboardAndMouse::*,
@@ -58,37 +58,98 @@ fn physical_desktop_rect() -> Result<DesktopRect> {
     result
 }
 
-// Never read or inject into a lock screen or UAC secure desktop. Opening the
-// input desktop also fails when the interactive session is inaccessible.
-fn desktop_available() -> bool {
+// Bind only the calling worker to the current input desktop. Network/runtime
+// threads never retain a secure-desktop binding across operations.
+struct DesktopBinding {
+    desktop: HDESK,
+    previous: HDESK,
+    name: String,
+}
+impl DesktopBinding {
+    fn open() -> Result<Self> {
+        unsafe {
+            let desktop = OpenInputDesktop(
+                0,
+                0,
+                DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_SWITCHDESKTOP,
+            );
+            ensure!(
+                !desktop.is_null(),
+                "无法访问 Windows 当前桌面：{}",
+                std::io::Error::last_os_error()
+            );
+            let previous = GetThreadDesktop(GetCurrentThreadId());
+            let mut binding = Self {
+                desktop,
+                previous,
+                name: String::new(),
+            };
+            binding.name = desktop_name(desktop)?;
+            ensure!(
+                binding.name.eq_ignore_ascii_case("Default")
+                    || (crate::windows_privilege::effective_system()
+                        && binding.name.eq_ignore_ascii_case("Winlogon")),
+                "当前进程无法访问 Windows 安全桌面，请以管理员身份启动共享"
+            );
+            ensure!(
+                SetThreadDesktop(desktop) != 0,
+                "无法切换 Windows 采集/输入线程桌面：{}",
+                std::io::Error::last_os_error()
+            );
+            Ok(binding)
+        }
+    }
+}
+impl Drop for DesktopBinding {
+    fn drop(&mut self) {
+        unsafe {
+            SetThreadDesktop(self.previous);
+            CloseDesktop(self.desktop);
+        }
+    }
+}
+fn desktop_name(desktop: HDESK) -> Result<String> {
+    let mut name = [0u16; 256];
+    let mut needed = 0;
+    ensure!(
+        unsafe {
+            GetUserObjectInformationW(
+                desktop,
+                UOI_NAME,
+                name.as_mut_ptr().cast(),
+                size_of_val(&name) as u32,
+                &mut needed,
+            )
+        } != 0,
+        "无法读取 Windows 桌面身份"
+    );
+    Ok(String::from_utf16_lossy(
+        &name[..name.iter().position(|c| *c == 0).unwrap_or(name.len())],
+    ))
+}
+fn current_desktop_name() -> Option<String> {
     unsafe {
         let desktop = OpenInputDesktop(0, 0, DESKTOP_READOBJECTS);
         if desktop.is_null() {
-            return false;
+            return None;
         }
-        let mut name = [0u16; 256];
-        let mut needed = 0;
-        let ok = GetUserObjectInformationW(
-            desktop,
-            UOI_NAME,
-            name.as_mut_ptr().cast(),
-            size_of_val(&name) as u32,
-            &mut needed,
-        );
+        let name = desktop_name(desktop).ok();
         CloseDesktop(desktop);
-        ok != 0
-            && String::from_utf16_lossy(
-                &name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())],
-            )
-            .eq_ignore_ascii_case("Default")
+        name
     }
+}
+fn desktop_available() -> bool {
+    current_desktop_name().is_some_and(|name| {
+        name.eq_ignore_ascii_case("Default")
+            || (crate::windows_privilege::effective_system()
+                && name.eq_ignore_ascii_case("Winlogon"))
+    })
 }
 
 pub struct CaptureSession {
     pub source: PreviewSource,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
-    input: Arc<Controller>,
 }
 impl Drop for CaptureSession {
     fn drop(&mut self) {
@@ -96,11 +157,10 @@ impl Drop for CaptureSession {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        self.input.stop();
     }
 }
 
-pub fn start(view_only: bool) -> Result<CaptureSession> {
+pub fn start(view_only: bool, experimental_lock_screen: bool) -> Result<CaptureSession> {
     let stop = Arc::new(AtomicBool::new(false));
     let input = Arc::new(Controller(Arc::new(Mutex::new(InputState::default()))));
     let (sender, frames) = watch::channel(None);
@@ -116,14 +176,20 @@ pub fn start(view_only: bool) -> Result<CaptureSession> {
             let dpi =
                 unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
             let initial = (|| -> Result<_> {
+                let identity = if experimental_lock_screen {
+                    Some(crate::windows_privilege::ThreadIdentity::enter()?)
+                } else {
+                    None
+                };
                 ensure!(!dpi.is_null(), "无法启用 Windows 物理像素坐标");
                 ensure!(
                     desktop_available(),
                     "请在已登录且解锁的 Windows 桌面启动服务"
                 );
-                desktop_rect()
+                let _desktop = DesktopBinding::open()?;
+                Ok((desktop_rect()?, identity))
             })();
-            let rect = match initial {
+            let (rect, _identity) = match initial {
                 Ok(value) => value,
                 Err(error) => {
                     let _ = init_tx.send(Err(format!("{error:#}")));
@@ -151,19 +217,20 @@ pub fn start(view_only: bool) -> Result<CaptureSession> {
                 let result = (|| -> Result<_> {
                     ensure!(
                         desktop_available(),
-                        "Windows 已锁屏或正在显示安全桌面；请在本机恢复桌面后重新连接"
+                        "Windows 当前桌面不可访问；请以管理员身份启动共享以访问锁屏"
                     );
+                    let binding = DesktopBinding::open()?;
                     let rect = desktop_rect()?;
                     let frame = capture(rect, sequence)?;
                     ensure!(
-                        desktop_available(),
+                        current_desktop_name().as_deref() == Some(&binding.name),
                         "Windows 桌面已切换，请恢复桌面后重新连接"
                     );
-                    Ok((rect, frame))
+                    Ok((rect, frame, binding.name.clone()))
                 })();
                 match result {
-                    Ok((rect, frame)) => {
-                        controller.record(sequence, rect);
+                    Ok((rect, frame, desktop)) => {
+                        controller.record(sequence, rect, desktop);
                         sender.send_replace(Some(CaptureEvent::Frame(Arc::new(frame))));
                         sequence += 1;
                     }
@@ -200,12 +267,135 @@ pub fn start(view_only: bool) -> Result<CaptureSession> {
             },
             frames,
             demand,
-            input: if view_only { None } else { Some(input.clone()) },
+            input: if view_only {
+                None
+            } else {
+                Some(Arc::new(ThreadController {
+                    controller: input,
+                    experimental_lock_screen,
+                }))
+            },
         },
         stop,
         worker: Some(worker),
-        input,
     })
+}
+
+// Only the worker below owns the real InputSession. Network threads exchange
+// bounded commands and never acquire SYSTEM impersonation or desktop handles.
+struct ThreadController {
+    controller: Arc<Controller>,
+    experimental_lock_screen: bool,
+}
+enum InputCommand {
+    Mouse(MouseEvent),
+    Key(KeyEvent),
+    ReleaseMouse,
+    ReleaseKeyboard,
+    ReleaseAll,
+}
+type InputRequest = (InputCommand, std::sync::mpsc::SyncSender<Result<()>>);
+struct ThreadSession {
+    sender: Option<std::sync::mpsc::SyncSender<InputRequest>>,
+    worker: Option<JoinHandle<()>>,
+}
+impl InputController for ThreadController {
+    fn acquire(&self) -> Result<Box<dyn InputSession>> {
+        let controller = self.controller.clone();
+        let experimental_lock_screen = self.experimental_lock_screen;
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<InputRequest>(8);
+        let (initialized, ready) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("windows-input".into())
+            .spawn(move || {
+                let setup = (|| -> Result<_> {
+                    let identity = if experimental_lock_screen {
+                        Some(crate::windows_privilege::ThreadIdentity::enter()?)
+                    } else {
+                        None
+                    };
+                    let session = controller.acquire()?;
+                    Ok((identity, session))
+                })();
+                let (_identity, mut session) = match setup {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = initialized.send(Err(format!("{error:#}")));
+                        return;
+                    }
+                };
+                if initialized.send(Ok(())).is_err() {
+                    return;
+                }
+                while let Ok((command, reply)) = receiver.recv() {
+                    let result = match command {
+                        InputCommand::Mouse(event) => session.apply(event),
+                        InputCommand::Key(event) => session.apply_key(event),
+                        InputCommand::ReleaseMouse => {
+                            session.release_mouse();
+                            Ok(())
+                        }
+                        InputCommand::ReleaseKeyboard => {
+                            session.release_keyboard();
+                            Ok(())
+                        }
+                        InputCommand::ReleaseAll => {
+                            session.release_all();
+                            Ok(())
+                        }
+                    };
+                    let _ = reply.send(result);
+                }
+                // session releases all held input before the impersonation ends.
+                drop(session);
+            })
+            .context("无法启动 Windows 输入线程")?;
+        let session = ThreadSession {
+            sender: Some(sender),
+            worker: Some(worker),
+        };
+        ready
+            .recv()
+            .context("Windows 输入线程提前退出")?
+            .map_err(anyhow::Error::msg)?;
+        Ok(Box::new(session))
+    }
+}
+impl ThreadSession {
+    fn request(&self, command: InputCommand) -> Result<()> {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        self.sender
+            .as_ref()
+            .context("Windows 输入已结束")?
+            .send((command, reply))
+            .map_err(|_| anyhow::anyhow!("Windows 输入线程已停止"))?;
+        result.recv().context("Windows 输入线程未响应")?
+    }
+}
+impl InputSession for ThreadSession {
+    fn apply(&mut self, event: MouseEvent) -> Result<()> {
+        self.request(InputCommand::Mouse(event))
+    }
+    fn apply_key(&mut self, event: KeyEvent) -> Result<()> {
+        self.request(InputCommand::Key(event))
+    }
+    fn release_mouse(&mut self) {
+        let _ = self.request(InputCommand::ReleaseMouse);
+    }
+    fn release_keyboard(&mut self) {
+        let _ = self.request(InputCommand::ReleaseKeyboard);
+    }
+    fn release_all(&mut self) {
+        let _ = self.request(InputCommand::ReleaseAll);
+    }
+}
+impl Drop for ThreadSession {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 struct Surface {
@@ -329,12 +519,18 @@ struct InputState {
     held: [bool; 3],
     keys: BTreeSet<KeyCode>,
     frames: DesktopFrames,
+    desktop: String,
 }
 #[derive(Clone)]
 struct Controller(Arc<Mutex<InputState>>);
 impl Controller {
-    fn record(&self, sequence: u64, rect: DesktopRect) {
+    fn record(&self, sequence: u64, rect: DesktopRect, desktop: String) {
         let mut state = self.0.lock().unwrap();
+        if state.desktop != desktop {
+            release_all_inputs(&mut state);
+            state.frames.clear();
+            state.desktop = desktop;
+        }
         if state.frames.layout_changed(rect) {
             release_all_inputs(&mut state);
         }
@@ -373,6 +569,11 @@ impl InputSession for ControlSession {
     fn apply(&mut self, event: MouseEvent) -> Result<()> {
         let mut state = self.0.0.lock().unwrap();
         let result = (|| -> Result<()> {
+            let binding = DesktopBinding::open()?;
+            ensure!(
+                binding.name == state.desktop,
+                "Windows 桌面已切换，请等待新画面"
+            );
             ensure!(state.available && desktop_available(), "Windows 桌面已暂停");
             let rect = state
                 .frames
@@ -426,6 +627,11 @@ impl InputSession for ControlSession {
     fn apply_key(&mut self, event: KeyEvent) -> Result<()> {
         let mut state = self.0.0.lock().unwrap();
         let result = (|| -> Result<()> {
+            let binding = DesktopBinding::open()?;
+            ensure!(
+                binding.name == state.desktop,
+                "Windows 桌面已切换，请等待新画面"
+            );
             if event.down {
                 ensure!(state.available && desktop_available(), "Windows 桌面已暂停");
                 let rect = state
@@ -501,6 +707,7 @@ fn release_mouse_buttons(state: &mut InputState) {
     }
 }
 fn send_mouse(flags: u32, data: u32, x: i32, y: i32) -> Result<()> {
+    let _desktop = DesktopBinding::open()?;
     let input = INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
@@ -516,12 +723,13 @@ fn send_mouse(flags: u32, data: u32, x: i32, y: i32) -> Result<()> {
     };
     ensure!(
         unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1,
-        "Windows 拒绝鼠标输入（不能控制权限更高的程序或安全桌面）"
+        "Windows 拒绝鼠标输入，请检查运行权限和系统策略"
     );
     Ok(())
 }
 
 fn send_key(key: KeyCode, down: bool) -> Result<()> {
+    let _desktop = DesktopBinding::open()?;
     let (virtual_key, extended) = crate::keyboard::windows_key(key);
     let input = INPUT {
         r#type: INPUT_KEYBOARD,
@@ -538,7 +746,58 @@ fn send_key(key: KeyCode, down: bool) -> Result<()> {
     };
     ensure!(
         unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1,
-        "Windows 拒绝键盘输入（不能控制权限更高的程序或安全桌面）"
+        "Windows 拒绝键盘输入；线程模拟不保证能通过 UIPI，请查看单进程验证说明"
     );
     Ok(())
+}
+
+/// Native proof-of-concept. Does not read or submit credentials. A successful
+/// SendInput call is only API acceptance, not proof that LogonUI handled it.
+pub fn probe(lock: bool) -> Result<()> {
+    let process_id = std::process::id();
+    println!("single-process probe: pid={process_id}; lock={lock}");
+    std::thread::spawn(move || -> Result<()> {
+        let _identity = crate::windows_privilege::ThreadIdentity::enter().context("stage=thread_identity")?;
+        println!("stage=thread_identity effective_system={}", crate::windows_privilege::effective_system());
+        ensure!(crate::windows_privilege::effective_system(), "探测需要以管理员身份运行");
+        let capture_probe = || -> Result<()> {
+            let binding = DesktopBinding::open().context("stage=desktop_binding")?;
+            println!("stage=desktop_binding desktop={}", binding.name);
+            let rect = physical_desktop_rect()?;
+            let frame = capture(rect, 0).context("stage=capture")?;
+            // Decode only in memory. Never upload a login-screen screenshot.
+            let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(&frame.jpeg));
+            let pixels = decoder.decode()?;
+            let low = pixels.iter().min().copied().unwrap_or(0);
+            let high = pixels.iter().max().copied().unwrap_or(0);
+            println!("stage=capture dimensions={}x{} pixel_range={low}..{high}", frame.width, frame.height);
+            ensure!(high.saturating_sub(low) > 2, "采集结果接近纯色，不能作为锁屏画面可用的证据");
+            let input = INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 { ki: KEYBDINPUT {
+                    wVk: VK_F24, wScan: 0, dwFlags: KEYEVENTF_KEYUP, time: 0, dwExtraInfo: 0,
+                } },
+            };
+            let accepted = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+            println!("stage=input_api key=F24 action=up accepted={accepted}; this_does_not_prove_unlock=true");
+            ensure!(accepted == 1, "SendInput 拒绝输入；不能证明单进程可控制当前桌面");
+            Ok(())
+        };
+        capture_probe().context("baseline desktop probe failed")?;
+        if lock {
+            ensure!(unsafe { windows_sys::Win32::System::Shutdown::LockWorkStation() } != 0,
+                "stage=lock_request failed: {}", std::io::Error::last_os_error());
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !current_desktop_name().is_some_and(|name| name.eq_ignore_ascii_case("Winlogon")) {
+                ensure!(Instant::now() < deadline, "stage=lock_wait: 未能访问 Winlogon 桌面，不能验证锁屏采集或输入");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            // Let LogonUI paint before sampling. This is not an unlock attempt.
+            std::thread::sleep(Duration::from_secs(2));
+            capture_probe().context("locked desktop probe failed")?;
+        }
+        ensure!(std::process::id() == process_id, "探测进程发生变化");
+        println!("probe complete; no login credential was submitted; actual_unlock_verified=false");
+        Ok(())
+    }).join().map_err(|_| anyhow::anyhow!("Windows 探测线程异常退出"))?
 }

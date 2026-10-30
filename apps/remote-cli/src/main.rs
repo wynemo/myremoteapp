@@ -16,6 +16,8 @@ mod preview;
 mod unlock_macos;
 #[cfg(target_os = "windows")]
 mod windows_host;
+#[cfg(target_os = "windows")]
+mod windows_privilege;
 #[cfg(target_os = "macos")]
 mod workspace_macos;
 
@@ -41,6 +43,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Windows 单进程桌面权限探测；--lock 会锁定当前机器，不自动解锁。
+    #[cfg(target_os = "windows")]
+    #[command(hide = true)]
+    WindowsDesktopProbe {
+        #[arg(long)]
+        lock: bool,
+    },
     /// 只读检查共享窗口的点击命中信息，不发送事件。
     #[cfg(target_os = "macos")]
     #[command(hide = true)]
@@ -80,6 +89,10 @@ enum Command {
         /// 仅共享画面，不启用键鼠控制；虚拟屏模式仍需辅助功能权限来移动窗口。
         #[arg(long, conflicts_with = "check_only")]
         view_only: bool,
+        /// 实验：单进程线程模拟访问 Windows 锁屏；需要管理员，尚未完成真实解锁验收。
+        #[cfg(target_os = "windows")]
+        #[arg(long, conflicts_with = "check_only")]
+        experimental_lock_screen: bool,
     },
     /// 通过直连或 SOCKS5 打开共享窗口预览。
     #[command(alias = "probe")]
@@ -111,6 +124,8 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
+        #[cfg(target_os = "windows")]
+        Command::WindowsDesktopProbe { lock } => windows_host::probe(lock)?,
         #[cfg(target_os = "macos")]
         Command::InputDiagnostics {
             window_id,
@@ -204,6 +219,8 @@ async fn main() -> Result<()> {
             desktop,
             check_only,
             view_only,
+            #[cfg(target_os = "windows")]
+            experimental_lock_screen,
         } => {
             #[cfg(not(target_os = "windows"))]
             anyhow::ensure!(
@@ -228,7 +245,7 @@ async fn main() -> Result<()> {
             let capture = if check_only {
                 None
             } else {
-                Some(windows_host::start(view_only)?)
+                Some(windows_host::start(view_only, experimental_lock_screen)?)
             };
             #[cfg(target_os = "windows")]
             let preview = {

@@ -103,6 +103,14 @@ jobs:
           if [[ "$RUNNER_OS" == Windows ]]; then args+=(--test-keyboard); fi
           python scripts/smoke_viewer.py "${args[@]}"
 
+      # Run last among GUI operations: this may lock the ephemeral CI VM.
+      # A permission denial is an experimental result, not a release-test pass.
+      - name: Probe single-process Windows lock-screen access
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: ./target/${{ matrix.target }}/release/remote-cli.exe windows-desktop-probe --lock
+
       - name: Package and verify architecture
         id: package
         run: python scripts/package.py --target ${{ matrix.target }}
