@@ -34,7 +34,7 @@ cargo run --locked --release -- serve --virtual-display
 
 不加 `--desktop` 也默认共享整个桌面；只观看可加 `--view-only`。允许 Windows 防火墙访问监听端口 9443，将 `.local\host\connect.json` 复制到客户端当前目录，使用该 Windows 的 IP 连接。
 
-需要包含此功能的新版 EXE，可从成功的 Windows CI 构建下载；完整桌面共享仍待实机验收。默认模式遇到锁屏或 UAC 安全桌面会暂停，需要本机恢复桌面后重新连接。管理员可选择[单进程锁屏实验](docs/windows-lock-screen.md)，尚未证实能够远程解锁。不安装 Windows 系统服务；暂不支持 Windows 单窗口选择。
+需要包含此功能的新版 EXE，可从成功的 Windows CI 构建下载；完整桌面共享仍待实机验收。默认模式遇到锁屏或 UAC 安全桌面会暂停，需要本机恢复桌面后重新连接。[单进程锁屏实验](docs/windows-lock-screen.md)的真实密码输入测试失败，当前不能远程解锁。不安装 Windows 系统服务；暂不支持 Windows 单窗口选择。
 
 ## 客户端：打开画面
 

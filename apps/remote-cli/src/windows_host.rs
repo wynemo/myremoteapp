@@ -790,9 +790,45 @@ fn keyboard_input(key: KeyCode, down: bool) -> KEYBDINPUT {
     }
 }
 
-/// Native proof-of-concept. Does not read or submit credentials. A successful
-/// SendInput call is only API acceptance, not proof that LogonUI handled it.
-pub fn probe(lock: bool, ci_unlock: bool) -> Result<()> {
+/// Native probe. The default mode never reads credentials. The explicitly
+/// gated disposable CI mode reads one fixture password from stdin and submits
+/// once. A SendInput return value alone never proves LogonUI processed input.
+pub fn probe(lock: bool, ci_unlock: bool, password_pipe: Option<String>) -> Result<()> {
+    let mut pipe = if let Some(name) = password_pipe {
+        ensure!(
+            ci_unlock
+                && std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+                && std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted"),
+            "测试管道只允许在一次性 GitHub runner 使用"
+        );
+        ensure!(
+            name.starts_with("myremoteapp-ci-")
+                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+            "无效的测试管道名称"
+        );
+        Some(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(format!("\\\\.\\pipe\\{name}"))?,
+        )
+    } else {
+        None
+    };
+    let result = probe_inner(lock, ci_unlock, pipe.as_mut());
+    if let Some(mut pipe) = pipe {
+        use std::io::Write;
+        let report = serde_json::json!({
+            "process_id": std::process::id(),
+            "actual_unlock_verified": ci_unlock && result.is_ok(),
+            "error": result.as_ref().err().map(|error| format!("{error:#}")),
+        });
+        writeln!(pipe, "{report}")?;
+        pipe.flush()?;
+    }
+    result
+}
+fn probe_inner(lock: bool, ci_unlock: bool, mut pipe: Option<&mut std::fs::File>) -> Result<()> {
     let password = if ci_unlock {
         ensure!(
             std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
@@ -801,7 +837,16 @@ pub fn probe(lock: bool, ci_unlock: bool) -> Result<()> {
         );
         use std::io::Read;
         let mut bytes = zeroize::Zeroizing::new(Vec::new());
-        std::io::stdin().take(129).read_to_end(&mut bytes)?;
+        if let Some(pipe) = pipe.as_mut() {
+            let mut size = [0u8; 4];
+            pipe.read_exact(&mut size)?;
+            let size = u32::from_le_bytes(size) as usize;
+            ensure!((4..=128).contains(&size), "临时测试凭据长度无效");
+            bytes.resize(size, 0);
+            pipe.read_exact(&mut bytes)?;
+        } else {
+            std::io::stdin().take(129).read_to_end(&mut bytes)?;
+        }
         ensure!(
             (4..=128).contains(&bytes.len())
                 && bytes
@@ -813,7 +858,6 @@ pub fn probe(lock: bool, ci_unlock: bool) -> Result<()> {
     } else {
         None
     };
-    crate::windows_privilege::prepare_input_integrity().context("stage=process_integrity")?;
     let process_id = std::process::id();
     println!("single-process probe: pid={process_id}; lock={lock}");
     std::thread::spawn(move || -> Result<()> {

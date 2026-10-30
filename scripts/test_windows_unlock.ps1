@@ -9,30 +9,45 @@ if (-not $account.Enabled) { throw 'Runner account is disabled.' }
 $entropy = [System.Security.Cryptography.RandomNumberGenerator]::GetBytes(16)
 $password = 'Aa1!' + [System.Convert]::ToHexString($entropy).ToLowerInvariant()
 $secure = ConvertTo-SecureString $password -AsPlainText -Force
-# This VM is destroyed after the job. Never apply this to a personal machine.
 Set-LocalUser -Name $account.Name -Password $secure
-# Secure-attention generation is outside the product's supported scope. Configure
-# only the disposable fixture so this test reaches the same password screen as
-# a user who does not require Ctrl+Alt+Del. Product startup never changes policy.
+# Test fixture only: reach a password screen without needing SAS generation.
 New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name DisableCAD -PropertyType DWord -Value 1 -Force | Out-Null
+$pipeName = 'myremoteapp-ci-' + [System.Guid]::NewGuid().ToString('N')
+$pipe = [System.IO.Pipes.NamedPipeServerStream]::new($pipeName, [System.IO.Pipes.PipeDirection]::InOut, 1, [System.IO.Pipes.PipeTransmissionMode]::Byte, [System.IO.Pipes.PipeOptions]::Asynchronous)
 $start = [System.Diagnostics.ProcessStartInfo]::new()
 $start.FileName = (Resolve-Path $Binary).Path
 $start.UseShellExecute = $false
-$start.RedirectStandardInput = $true
 $start.ArgumentList.Add('windows-desktop-probe')
 $start.ArgumentList.Add('--lock')
 $start.ArgumentList.Add('--ci-unlock')
+$start.ArgumentList.Add('--ci-password-pipe')
+$start.ArgumentList.Add($pipeName)
 $process = [System.Diagnostics.Process]::Start($start)
 try {
-    # Pipe the generated fixture secret; never put it in argv, env or logs.
-    $process.StandardInput.Write($password)
-    $process.StandardInput.Close()
-    if (-not $process.WaitForExit(90000)) {
-        $process.Kill()
-        throw 'Unlock fixture timed out.'
+    $connected = $pipe.WaitForConnectionAsync()
+    if (-not $connected.Wait(30000)) { throw 'Replacement process did not connect to the fixture pipe.' }
+    # The original admin process must exit. Only its SYSTEM replacement remains.
+    if (-not $process.WaitForExit(10000) -or $process.ExitCode -ne 0) {
+        throw 'The original process failed to exit after self-restart.'
     }
-    exit $process.ExitCode
+    $payload = [System.Text.Encoding]::UTF8.GetBytes($password)
+    $length = [System.BitConverter]::GetBytes([uint32]$payload.Length)
+    $pipe.Write($length, 0, $length.Length)
+    $pipe.Write($payload, 0, $payload.Length)
+    $pipe.Flush()
+    [System.Array]::Clear($payload, 0, $payload.Length)
+    $reader = [System.IO.StreamReader]::new($pipe)
+    $read = $reader.ReadLineAsync()
+    if (-not $read.Wait(60000)) { throw 'Actual unlock verification timed out.' }
+    $line = $read.Result
+    if (-not $line) { throw 'Replacement exited without an unlock report.' }
+    Write-Host "unlock_report=$line"
+    $report = $line | ConvertFrom-Json
+    if ($report.process_id -eq $process.Id) { throw 'Self-restart did not create a replacement.' }
+    if (-not $report.actual_unlock_verified) { throw 'Actual password submission did not unlock the Windows session.' }
+    Write-Host 'Original process exited; one SYSTEM replacement completed an actual password unlock.'
 } finally {
+    $pipe.Dispose()
     $secure.Dispose()
     [System.Array]::Clear($entropy, 0, $entropy.Length)
     $password = $null

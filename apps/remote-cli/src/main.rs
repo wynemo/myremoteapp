@@ -52,6 +52,9 @@ enum Command {
         /// 仅限一次性 GitHub runner：从标准输入读取临时测试密码并提交一次。
         #[arg(long, requires = "lock", hide = true)]
         ci_unlock: bool,
+        /// 一次性 runner 的双向测试管道；仅传管道名称，不传密码。
+        #[arg(long, requires = "ci_unlock", hide = true)]
+        ci_password_pipe: Option<String>,
     },
     /// 只读检查共享窗口的点击命中信息，不发送事件。
     #[cfg(target_os = "macos")]
@@ -128,7 +131,16 @@ enum Command {
 async fn main() -> Result<()> {
     match Cli::parse().command {
         #[cfg(target_os = "windows")]
-        Command::WindowsDesktopProbe { lock, ci_unlock } => windows_host::probe(lock, ci_unlock)?,
+        Command::WindowsDesktopProbe {
+            lock,
+            ci_unlock,
+            ci_password_pipe,
+        } => {
+            if windows_privilege::restart_as_system()? {
+                return Ok(());
+            }
+            windows_host::probe(lock, ci_unlock, ci_password_pipe)?;
+        }
         #[cfg(target_os = "macos")]
         Command::InputDiagnostics {
             window_id,
@@ -236,8 +248,8 @@ async fn main() -> Result<()> {
                 "Windows 服务端共享整个桌面，不支持 --window-id 或 --virtual-display"
             );
             #[cfg(target_os = "windows")]
-            if experimental_lock_screen {
-                windows_privilege::prepare_input_integrity()?;
+            if experimental_lock_screen && windows_privilege::restart_as_system()? {
+                return Ok(());
             }
             let listener = TcpListener::bind(&listen).await?;
             #[cfg(target_os = "macos")]

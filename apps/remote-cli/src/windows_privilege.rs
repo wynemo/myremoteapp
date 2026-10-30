@@ -1,10 +1,12 @@
-//! Thread-scoped experiment: no child processes, services, tasks or autorun.
+//! Optional one-time SYSTEM self-restart; no resident helper or system service.
 //! Only dedicated capture/input workers may enter this identity. Never retain
 //! an impersonation across an await or use it on a network/runtime thread.
 use anyhow::{Context, Result, ensure};
 use std::{
+    ffi::OsStr,
     marker::PhantomData,
     mem::{size_of, size_of_val},
+    os::windows::ffi::OsStrExt,
     ptr::null_mut,
     rc::Rc,
 };
@@ -155,7 +157,7 @@ impl ThreadIdentity {
                 && unsafe { GetLastError() } != ERROR_NOT_ALL_ASSIGNED,
             "系统策略不允许桌面线程取得锁屏访问权限"
         );
-        let system = current_session_token()?;
+        let system = current_session_token(false)?;
         // The duplicated token contains only TOKEN_QUERY/TOKEN_IMPERSONATE
         // handle access, and cannot be used by this code to launch a process.
         ensure!(
@@ -174,7 +176,7 @@ impl Drop for ThreadIdentity {
         }
     }
 }
-fn current_session_token() -> Result<Handle> {
+fn current_session_token(primary: bool) -> Result<Handle> {
     let mut session = 0;
     ensure!(
         unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) } != 0 && session != 0,
@@ -215,10 +217,18 @@ fn current_session_token() -> Result<Handle> {
                 unsafe {
                     DuplicateTokenEx(
                         source.0,
-                        TOKEN_QUERY | TOKEN_IMPERSONATE,
+                        if primary {
+                            TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY
+                        } else {
+                            TOKEN_QUERY | TOKEN_IMPERSONATE
+                        },
                         null_mut(),
                         SecurityImpersonation,
-                        TokenImpersonation,
+                        if primary {
+                            TokenPrimary
+                        } else {
+                            TokenImpersonation
+                        },
                         &mut impersonation,
                     )
                 } != 0,
@@ -230,6 +240,92 @@ fn current_session_token() -> Result<Handle> {
         more = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
     }
     None.context("未找到当前会话的 Windows 登录进程")
+}
+
+/// Returns true only in the original administrator process after creating its
+/// replacement. The caller must return immediately; no parent waits or helper
+/// remains alive. The SYSTEM replacement skips this path by checking its SID.
+pub fn restart_as_system() -> Result<bool> {
+    if system_token(process_token()?.0)? {
+        return Ok(false);
+    }
+    ensure!(elevated()?, "锁屏模式需要从管理员 PowerShell 启动");
+    let pid = std::thread::spawn(|| -> Result<u32> {
+        let _identity = ThreadIdentity::enter()?;
+        let primary = current_session_token(true)?;
+        let executable = std::env::current_exe()?;
+        let mut arguments = vec![executable.as_os_str().to_owned()];
+        arguments.extend(std::env::args_os().skip(1));
+        let mut command = Vec::new();
+        for arg in arguments {
+            if !command.is_empty() {
+                command.push(b' ' as u16);
+            }
+            command.extend(quote(&arg));
+        }
+        command.push(0);
+        let directory = wide(std::env::current_dir()?);
+        let mut desktop = wide("winsta0\\default");
+        let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+        startup.cb = size_of::<STARTUPINFOW>() as u32;
+        startup.lpDesktop = desktop.as_mut_ptr();
+        let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        ensure!(
+            unsafe {
+                CreateProcessWithTokenW(
+                    primary.0,
+                    0,
+                    wide(&executable).as_ptr(),
+                    command.as_mut_ptr(),
+                    CREATE_NEW_CONSOLE | CREATE_SUSPENDED,
+                    null_mut(),
+                    directory.as_ptr(),
+                    &startup,
+                    &mut info,
+                )
+            } != 0,
+            "无法以 SYSTEM 身份重新启动当前程序：{}",
+            std::io::Error::last_os_error()
+        );
+        let process = Handle::new(info.hProcess)?;
+        let thread = Handle::new(info.hThread)?;
+        if unsafe { ResumeThread(thread.0) } == u32::MAX {
+            unsafe {
+                TerminateProcess(process.0, 1);
+            }
+            anyhow::bail!("无法启动替代进程：{}", std::io::Error::last_os_error());
+        }
+        Ok(info.dwProcessId)
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("SYSTEM 自重启线程异常退出"))??;
+    println!(
+        "已在新窗口以 SYSTEM 身份重启自身（PID={pid}），原进程现在退出；不安装服务、不保留辅助进程。请在新窗口按 Ctrl+C 停止共享。"
+    );
+    Ok(true)
+}
+fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
+    value.as_ref().encode_wide().chain(Some(0)).collect()
+}
+fn quote(value: &OsStr) -> Vec<u16> {
+    let mut out = vec![b'"' as u16];
+    let mut slashes = 0;
+    for c in value.encode_wide() {
+        if c == b'\\' as u16 {
+            slashes += 1;
+            continue;
+        }
+        if c == b'"' as u16 {
+            out.extend(std::iter::repeat_n(b'\\' as u16, slashes * 2 + 1));
+        } else {
+            out.extend(std::iter::repeat_n(b'\\' as u16, slashes));
+        }
+        slashes = 0;
+        out.push(c);
+    }
+    out.extend(std::iter::repeat_n(b'\\' as u16, slashes * 2));
+    out.push(b'"' as u16);
+    out
 }
 
 /// Some USER input APIs reject a caller while it is impersonating, even on the
@@ -277,88 +373,6 @@ impl Drop for ProcessIdentity {
             std::process::abort();
         }
     }
-}
-
-/// UIPI tags injected input with the process integrity, not just the worker's
-/// impersonation identity. Change only this process's label before USER/GDI
-/// initialization. The process SID stays the launching administrator's SID.
-pub fn prepare_input_integrity() -> Result<()> {
-    std::thread::spawn(|| -> Result<()> {
-        let _identity = ThreadIdentity::enter()?;
-        let mut effective = null_mut();
-        ensure!(
-            unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 0, &mut effective) } != 0,
-            "无法读取锁屏线程完整性身份"
-        );
-        let effective = Handle::new(effective)?;
-        let mut data = [0usize; 64];
-        let mut length = 0;
-        ensure!(
-            unsafe {
-                GetTokenInformation(
-                    effective.0,
-                    TokenIntegrityLevel,
-                    data.as_mut_ptr().cast(),
-                    size_of_val(&data) as u32,
-                    &mut length,
-                )
-            } != 0,
-            "无法读取 SYSTEM 完整性级别"
-        );
-        let label = unsafe { &*data.as_ptr().cast::<TOKEN_MANDATORY_LABEL>() };
-        ensure!(
-            unsafe { IsWellKnownSid(label.Label.Sid, WinSystemLabelSid) } != 0,
-            "锁屏线程令牌没有 SYSTEM 完整性级别"
-        );
-        let mut raw = null_mut();
-        ensure!(
-            unsafe {
-                OpenProcessToken(
-                    GetCurrentProcess(),
-                    TOKEN_QUERY | TOKEN_ADJUST_DEFAULT,
-                    &mut raw,
-                )
-            } != 0,
-            "无法打开当前程序的完整性配置：{}",
-            std::io::Error::last_os_error()
-        );
-        let own = Handle::new(raw)?;
-        ensure!(
-            unsafe {
-                SetTokenInformation(own.0, TokenIntegrityLevel, data.as_ptr().cast(), length)
-            } != 0,
-            "系统拒绝调整当前程序的输入完整性级别，无法控制锁屏：{}",
-            std::io::Error::last_os_error()
-        );
-        let mut verified = [0usize; 64];
-        ensure!(
-            unsafe {
-                GetTokenInformation(
-                    own.0,
-                    TokenIntegrityLevel,
-                    verified.as_mut_ptr().cast(),
-                    size_of_val(&verified) as u32,
-                    &mut length,
-                )
-            } != 0,
-            "无法验证当前程序的完整性级别"
-        );
-        let sid = unsafe {
-            (*verified.as_ptr().cast::<TOKEN_MANDATORY_LABEL>())
-                .Label
-                .Sid
-        };
-        ensure!(
-            unsafe { IsWellKnownSid(sid, WinSystemLabelSid) } != 0,
-            "当前程序的输入完整性级别验证失败"
-        );
-        println!(
-            "stage=process_integrity level=system; same_process=true; service_installed=false"
-        );
-        Ok(())
-    })
-    .join()
-    .map_err(|_| anyhow::anyhow!("输入完整性初始化线程异常退出"))?
 }
 
 /// Metadata only: never inspect window titles, text fields, or input values.
@@ -418,6 +432,31 @@ pub fn input_context() -> Result<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn restarted_arguments_roundtrip_unicode_quotes_and_trailing_slashes() {
+        use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
+        for value in ["", "hello world", "C:\\中文目录\\", "a\\\"b"] {
+            let mut command: Vec<u16> = "program.exe ".encode_utf16().collect();
+            command.extend(quote(OsStr::new(value)));
+            command.push(0);
+            let mut count = 0;
+            unsafe {
+                let args = CommandLineToArgvW(command.as_ptr(), &mut count);
+                assert!(!args.is_null());
+                assert_eq!(count, 2);
+                let arg = *args.add(1);
+                let mut length = 0;
+                while *arg.add(length) != 0 {
+                    length += 1;
+                }
+                assert_eq!(
+                    String::from_utf16_lossy(std::slice::from_raw_parts(arg, length)),
+                    value
+                );
+                LocalFree(args.cast());
+            }
+        }
+    }
     // An actual Windows test, not a mocked permission check. It also runs in CI
     // without taking over the runner's desktop or synthesizing any input.
     #[test]
