@@ -2,6 +2,8 @@
 mod capture_readiness;
 #[cfg(any(target_os = "windows", test))]
 mod desktop_geometry;
+#[cfg(any(target_os = "windows", test))]
+mod desktop_recovery;
 #[cfg(target_os = "macos")]
 mod input_macos;
 #[cfg(any(target_os = "windows", target_os = "macos"))]

@@ -208,8 +208,11 @@ pub fn start(view_only: bool, experimental_lock_screen: bool) -> Result<CaptureS
             }
             let mut sequence = 0;
             let mut sharing = false;
+            let mut recovery =
+                crate::desktop_recovery::DesktopRecovery::new(experimental_lock_screen);
             while !stopped.load(Ordering::Acquire) {
                 if !capture_demand.is_active() {
+                    recovery.reset();
                     if sharing {
                         controller.stop();
                         sender.send_replace(None);
@@ -230,19 +233,26 @@ pub fn start(view_only: bool, experimental_lock_screen: bool) -> Result<CaptureS
                     let frame = capture(rect, sequence)?;
                     ensure!(
                         current_desktop_name().as_deref() == Some(&binding.name),
-                        "Windows 桌面已切换，请恢复桌面后重新连接"
+                        "Windows 桌面正在切换"
                     );
                     Ok((rect, frame, binding.name.clone()))
                 })();
                 match result {
                     Ok((rect, frame, desktop)) => {
+                        recovery.reset();
                         controller.record(sequence, rect, desktop);
                         sender.send_replace(Some(CaptureEvent::Frame(Arc::new(frame))));
                         sequence += 1;
                     }
                     Err(error) => {
                         controller.stop();
-                        sender.send_replace(Some(CaptureEvent::Stopped(format!("{error:#}"))));
+                        if recovery.retry(Instant::now()) {
+                            // None pauses this preview without sending an end marker.
+                            // Clear stale imagery and input until the new desktop is ready.
+                            sender.send_replace(None);
+                        } else {
+                            sender.send_replace(Some(CaptureEvent::Stopped(format!("{error:#}"))));
+                        }
                     }
                 }
                 std::thread::sleep(Duration::from_millis(100).saturating_sub(tick.elapsed()));
@@ -646,12 +656,12 @@ impl InputSession for ControlSession {
     fn apply_key(&mut self, event: KeyEvent) -> Result<()> {
         let mut state = self.0.0.lock().unwrap();
         let result = (|| -> Result<()> {
-            let binding = DesktopBinding::open()?;
-            ensure!(
-                binding.name == state.desktop,
-                "Windows 桌面已切换，请等待新画面"
-            );
             if event.down {
+                let binding = DesktopBinding::open()?;
+                ensure!(
+                    binding.name == state.desktop,
+                    "Windows 桌面已切换，请等待新画面"
+                );
                 ensure!(state.available && desktop_available(), "Windows 桌面已暂停");
                 let rect = state
                     .frames
@@ -821,6 +831,7 @@ pub fn probe(lock: bool, ci_unlock: bool, password_pipe: Option<String>) -> Resu
         let report = serde_json::json!({
             "process_id": std::process::id(),
             "actual_unlock_verified": ci_unlock && result.is_ok(),
+            "preview_continuity_verified": ci_unlock && result.is_ok(),
             "error": result.as_ref().err().map(|error| format!("{error:#}")),
         });
         writeln!(pipe, "{report}")?;
@@ -892,6 +903,8 @@ fn probe_inner(lock: bool, ci_unlock: bool, mut pipe: Option<&mut std::fs::File>
             Ok(())
         };
         capture_probe().context("baseline desktop probe failed")?;
+        let capture = if ci_unlock { Some(start(true, true)?) } else { None };
+        let mut preview = capture.as_ref().map(|capture| CiPreview::start(capture.source.clone())).transpose()?;
         if lock {
             let requested = {
                 let _process_identity = crate::windows_privilege::ProcessIdentity::enter()?;
@@ -911,12 +924,111 @@ fn probe_inner(lock: bool, ci_unlock: bool, mut pipe: Option<&mut std::fs::File>
         ensure!(std::process::id() == process_id, "探测进程发生变化");
         if let Some(password) = password {
             verify_ci_unlock(&password)?;
-            println!("probe complete; actual_unlock_verified=true; fixture_credential_submitted_once=true");
+            if let Some(preview) = preview.take() { preview.verify_resumed()?; }
+            println!("probe complete; actual_unlock_verified=true; preview_continuity_verified=true; fixture_credential_submitted_once=true");
         } else {
             println!("probe complete; no login credential was submitted; actual_unlock_verified=false");
         }
         Ok(())
     }).join().map_err(|_| anyhow::anyhow!("Windows 探测线程异常退出"))?
+}
+
+// Observe the actual Windows capture backend through one preview protocol
+// session from before locking until after unlock. No reconnection is allowed.
+struct CiPreview {
+    sequence: Arc<std::sync::atomic::AtomicU64>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    worker: Option<JoinHandle<Result<()>>>,
+}
+impl CiPreview {
+    fn start(source: PreviewSource) -> Result<Self> {
+        let sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let latest = sequence.clone();
+        let (stop, mut shutdown) = tokio::sync::oneshot::channel();
+        let (ready, initialized) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async move {
+                let (mut client, mut server) = tokio::io::duplex(256 * 1024);
+                let host = tokio::spawn(async move { remote_session::serve_with_preview(&mut server, Some(source)).await });
+                let mut ready = Some(ready);
+                let result = async {
+                    remote_session::start_preview(&mut client).await?;
+                    loop {
+                        let frame = tokio::select! {
+                            _ = &mut shutdown => break,
+                            frame = tokio::time::timeout(remote_session::IO_TIMEOUT, remote_protocol::read_frame(&mut client)) => frame??,
+                        }.context("Preview ended during desktop transition; reconnect would be required")?;
+                        latest.store(frame.sequence, Ordering::Release);
+                        if let Some(ready) = ready.take() { let _ = ready.send(Ok(())); }
+                    }
+                    Ok(())
+                }.await;
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(Err(format!("{result:?}")));
+                }
+                host.abort();
+                let _ = host.await;
+                result
+            })
+        });
+        let preview = Self {
+            sequence,
+            stop: Some(stop),
+            worker: Some(worker),
+        };
+        initialized
+            .recv_timeout(remote_session::IO_TIMEOUT)
+            .context("Preview fixture did not receive its first frame")?
+            .map_err(anyhow::Error::msg)?;
+        Ok(preview)
+    }
+    fn verify_resumed(mut self) -> Result<()> {
+        // Demand genuinely newer captured frames; repeated heartbeat frames do
+        // not advance the sequence. Allow any in-flight lock-screen frame first.
+        let baseline = self.sequence.load(Ordering::Acquire);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.sequence.load(Ordering::Acquire) < baseline + 3 {
+            if self
+                .worker
+                .as_ref()
+                .is_some_and(|worker| worker.is_finished())
+            {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "No fresh desktop frames after unlock on the existing preview session"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        self.worker
+            .take()
+            .unwrap()
+            .join()
+            .map_err(|_| anyhow::anyhow!("Preview fixture worker failed"))??;
+        ensure!(
+            self.sequence.load(Ordering::Acquire) >= baseline + 3,
+            "Preview did not resume after unlock"
+        );
+        println!("stage=preview_continuity verified=true; preview_sessions=1; reconnected=false");
+        Ok(())
+    }
+}
+impl Drop for CiPreview {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 // Exercises the actual dedicated input worker and frame checks. Only the CI
@@ -1106,6 +1218,18 @@ mod tests {
             assert_eq!(down.dwFlags & KEYEVENTF_EXTENDEDKEY != 0, extended);
             assert_eq!(up.dwFlags, down.dwFlags | KEYEVENTF_KEYUP);
         }
+    }
+    #[test]
+    fn released_key_after_transition_does_not_require_an_old_desktop_frame() {
+        let controller = Controller(Arc::new(Mutex::new(InputState::default())));
+        let mut session = ControlSession(controller);
+        session
+            .apply_key(KeyEvent {
+                frame_sequence: u64::MAX,
+                key: KeyCode::Enter,
+                down: false,
+            })
+            .unwrap();
     }
     #[test]
     fn desktop_transition_invalidates_same_size_old_frames() {

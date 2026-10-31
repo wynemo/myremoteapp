@@ -70,7 +70,8 @@ try {
     $report = $line | ConvertFrom-Json
     if ($report.process_id -eq $process.Id) { throw 'Self-restart did not create a replacement.' }
     if (-not $report.actual_unlock_verified) { throw 'Actual password submission did not unlock the Windows session.' }
-    Write-Host 'Original process exited; one SYSTEM replacement completed an actual password unlock.'
+    if (-not $report.preview_continuity_verified) { throw 'Preview session did not survive unlock.' }
+    Write-Host 'Original process exited; actual password unlock succeeded and the existing preview resumed without reconnecting.'
 } finally {
     $pipe.Dispose()
     $secure.Dispose()
