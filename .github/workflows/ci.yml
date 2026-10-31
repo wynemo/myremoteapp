@@ -103,6 +103,31 @@ jobs:
           if [[ "$RUNNER_OS" == Windows ]]; then args+=(--test-keyboard); fi
           python scripts/smoke_viewer.py "${args[@]}"
 
+      # Run last among GUI operations: this may lock the ephemeral CI VM.
+      # Require real password submission to restore the original desktop.
+      - name: Test Windows lock-screen password input
+        id: lock_probe
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/test_windows_unlock.ps1 -Binary ./target/${{ matrix.target }}/release/remote-cli.exe
+
+      - name: Upload disposable login UI before fixture credential entry
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: windows-unlock-fixture-screens
+          path: |
+            ${{ runner.temp }}/myremoteapp-unlock-*.jpg
+            ${{ runner.temp }}/myremoteapp-unlock-controls-*.txt
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Record Windows lock-screen experiment outcome
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "Windows single-process lock-screen probe: ${{ steps.lock_probe.outcome }}. See probe logs for actual_unlock_verified; API acceptance alone does not prove unlock." >> $env:GITHUB_STEP_SUMMARY
+
       - name: Package and verify architecture
         id: package
         run: python scripts/package.py --target ${{ matrix.target }}

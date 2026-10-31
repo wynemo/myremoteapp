@@ -34,7 +34,13 @@ cargo run --locked --release -- serve --virtual-display
 
 不加 `--desktop` 也默认共享整个桌面；只观看可加 `--view-only`。允许 Windows 防火墙访问监听端口 9443，将 `.local\host\connect.json` 复制到客户端当前目录，使用该 Windows 的 IP 连接。
 
-需要包含此功能的新版 EXE，可从成功的 Windows CI 构建下载；完整桌面共享仍待实机验收。暂不支持 Windows 单窗口选择、后台系统服务、远程解锁、UAC 安全桌面及控制权限更高的程序；本机恢复桌面后重新连接。
+需要锁屏输入时，改在管理员 PowerShell 运行 `serve --desktop --experimental-lock-screen`。程序会在新窗口以 SYSTEM 身份重启自身，原进程退出，运行中只保留一个远控进程；不安装系统服务。在新窗口按 Ctrl+C 停止。新版 EXE 和完整步骤见 [Windows 锁屏说明](docs/windows-lock-screen.md)，正常解锁后画面在原连接中自动恢复，无需再连接。已通过 Windows CI 真实密码解锁及同一预览连接恢复测试；HDMI 模拟器下的手动会话交接已通过实机验收，新增自动交接仍需实机复测。
+
+默认模式遇到锁屏或 UAC 安全桌面会暂停。暂不支持 Windows 单窗口选择、Ctrl+Alt+Del 登录策略、BitLocker 或重启后自动运行；PIN 和多屏行为尚待实机验收。
+
+无实体显示器时，保持 HDMI 显示模拟器插入。从 RDP 的管理员 PowerShell 启动锁屏模式后，程序自动将当前会话交给控制台并确认锁屏，RDP 会断开；随后用本程序连接并输入 Windows 密码，无需手动执行会话交接命令。已有程序和配对文件保留，不安装驱动。
+
+无有效显示输出仍不受支持；Windows 持久虚拟显示尚未实现。普通模式不自动交接 RDP 会话。
 
 ## 客户端：打开画面
 

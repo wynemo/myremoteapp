@@ -1,7 +1,11 @@
+#[cfg(any(target_os = "windows", test))]
+mod bgra_resize;
 #[cfg(any(target_os = "macos", test))]
 mod capture_readiness;
 #[cfg(any(target_os = "windows", test))]
 mod desktop_geometry;
+#[cfg(any(target_os = "windows", test))]
+mod desktop_recovery;
 #[cfg(target_os = "macos")]
 mod input_macos;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -15,7 +19,11 @@ mod preview;
 #[cfg(target_os = "macos")]
 mod unlock_macos;
 #[cfg(target_os = "windows")]
+mod windows_console;
+#[cfg(target_os = "windows")]
 mod windows_host;
+#[cfg(target_os = "windows")]
+mod windows_privilege;
 #[cfg(target_os = "macos")]
 mod workspace_macos;
 
@@ -41,6 +49,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Windows 单进程桌面权限探测；--lock 会锁定当前机器，不自动解锁。
+    #[cfg(target_os = "windows")]
+    #[command(hide = true)]
+    WindowsDesktopProbe {
+        #[arg(long)]
+        lock: bool,
+        /// 仅限一次性 GitHub runner：从标准输入读取临时测试密码并提交一次。
+        #[arg(long, requires = "lock", hide = true)]
+        ci_unlock: bool,
+        /// 一次性 runner 的双向测试管道；仅传管道名称，不传密码。
+        #[arg(long, requires = "ci_unlock", hide = true)]
+        ci_password_pipe: Option<String>,
+    },
     /// 只读检查共享窗口的点击命中信息，不发送事件。
     #[cfg(target_os = "macos")]
     #[command(hide = true)]
@@ -80,6 +101,10 @@ enum Command {
         /// 仅共享画面，不启用键鼠控制；虚拟屏模式仍需辅助功能权限来移动窗口。
         #[arg(long, conflicts_with = "check_only")]
         view_only: bool,
+        /// 实验：单进程线程模拟访问 Windows 锁屏；需要管理员，尚未完成真实解锁验收。
+        #[cfg(target_os = "windows")]
+        #[arg(long, conflicts_with = "check_only")]
+        experimental_lock_screen: bool,
     },
     /// 通过直连或 SOCKS5 打开共享窗口预览。
     #[command(alias = "probe")]
@@ -111,6 +136,17 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
+        #[cfg(target_os = "windows")]
+        Command::WindowsDesktopProbe {
+            lock,
+            ci_unlock,
+            ci_password_pipe,
+        } => {
+            if windows_privilege::restart_as_system()? {
+                return Ok(());
+            }
+            windows_host::probe(lock, ci_unlock, ci_password_pipe)?;
+        }
         #[cfg(target_os = "macos")]
         Command::InputDiagnostics {
             window_id,
@@ -204,6 +240,8 @@ async fn main() -> Result<()> {
             desktop,
             check_only,
             view_only,
+            #[cfg(target_os = "windows")]
+            experimental_lock_screen,
         } => {
             #[cfg(not(target_os = "windows"))]
             anyhow::ensure!(
@@ -215,6 +253,14 @@ async fn main() -> Result<()> {
                 window_id.is_none() && !virtual_display,
                 "Windows 服务端共享整个桌面，不支持 --window-id 或 --virtual-display"
             );
+            #[cfg(target_os = "windows")]
+            if experimental_lock_screen && windows_privilege::restart_as_system()? {
+                return Ok(());
+            }
+            #[cfg(target_os = "windows")]
+            if experimental_lock_screen {
+                windows_console::prepare()?;
+            }
             let listener = TcpListener::bind(&listen).await?;
             #[cfg(target_os = "macos")]
             let mut capture = if check_only {
@@ -228,7 +274,7 @@ async fn main() -> Result<()> {
             let capture = if check_only {
                 None
             } else {
-                Some(windows_host::start(view_only)?)
+                Some(windows_host::start(view_only, experimental_lock_screen)?)
             };
             #[cfg(target_os = "windows")]
             let preview = {

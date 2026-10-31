@@ -513,6 +513,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preview_pause_resumes_on_the_same_stream_without_end_marker() {
+        let frame = |sequence| {
+            CaptureEvent::Frame(Arc::new(PreviewFrame {
+                width: 4,
+                height: 4,
+                sequence,
+                jpeg: vec![7],
+            }))
+        };
+        let (sender, frames) = watch::channel(Some(frame(1)));
+        let source = PreviewSource {
+            window: WindowInfo {
+                id: 5,
+                app: "Windows".into(),
+                title: "Desktop".into(),
+                width: 4,
+                height: 4,
+            },
+            frames,
+            demand: PreviewDemand::default(),
+            input: None,
+        };
+        let demand = source.demand.clone();
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let host = tokio::spawn(async move { serve_with_preview(&mut server, Some(source)).await });
+        start_preview(&mut client).await.unwrap();
+        assert_eq!(
+            remote_protocol::read_frame(&mut client)
+                .await
+                .unwrap()
+                .unwrap()
+                .sequence,
+            1
+        );
+        sender.send_replace(None);
+        assert!(
+            timeout(
+                Duration::from_millis(50),
+                remote_protocol::read_frame(&mut client)
+            )
+            .await
+            .is_err()
+        );
+        assert!(demand.is_active());
+        assert!(!host.is_finished());
+        sender.send_replace(Some(frame(2)));
+        assert_eq!(
+            timeout(IO_TIMEOUT, remote_protocol::read_frame(&mut client))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .sequence,
+            2
+        );
+        sender.send_replace(Some(CaptureEvent::Stopped(
+            "persistent capture failure".into(),
+        )));
+        assert!(
+            remote_protocol::read_frame(&mut client)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(host.await.unwrap().is_err());
+        assert!(!demand.is_active());
+    }
+
+    #[tokio::test]
     async fn capture_demand_tracks_only_video_and_releases_on_cancellation() {
         let (_sender, frames) = watch::channel(None);
         let demand = PreviewDemand::default();

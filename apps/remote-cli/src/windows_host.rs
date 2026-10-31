@@ -19,13 +19,13 @@ use std::{
 use tokio::sync::watch;
 use windows_sys::Win32::{
     Graphics::Gdi::*,
-    System::StationsAndDesktops::*,
+    System::{StationsAndDesktops::*, Threading::GetCurrentThreadId},
     UI::{
         HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext},
         Input::KeyboardAndMouse::*,
         WindowsAndMessaging::{
-            GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-            SM_YVIRTUALSCREEN, WHEEL_DELTA,
+            GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId, SM_CXVIRTUALSCREEN,
+            SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WHEEL_DELTA,
         },
     },
 };
@@ -58,37 +58,104 @@ fn physical_desktop_rect() -> Result<DesktopRect> {
     result
 }
 
-// Never read or inject into a lock screen or UAC secure desktop. Opening the
-// input desktop also fails when the interactive session is inaccessible.
-fn desktop_available() -> bool {
+// Bind only the calling worker to the current input desktop. Network/runtime
+// threads never retain a secure-desktop binding across operations.
+struct DesktopBinding {
+    desktop: HDESK,
+    previous: HDESK,
+    name: String,
+}
+impl DesktopBinding {
+    fn open() -> Result<Self> {
+        unsafe {
+            let previous = GetThreadDesktop(GetCurrentThreadId());
+            ensure!(!previous.is_null(), "无法保存原线程桌面");
+            let desktop = OpenInputDesktop(
+                0,
+                0,
+                DESKTOP_READOBJECTS
+                    | DESKTOP_WRITEOBJECTS
+                    | DESKTOP_SWITCHDESKTOP
+                    | DESKTOP_JOURNALPLAYBACK,
+            );
+            ensure!(
+                !desktop.is_null(),
+                "无法访问 Windows 当前桌面：{}",
+                std::io::Error::last_os_error()
+            );
+            let mut binding = Self {
+                desktop,
+                previous,
+                name: String::new(),
+            };
+            binding.name = desktop_name(desktop)?;
+            ensure!(
+                binding.name.eq_ignore_ascii_case("Default")
+                    || (crate::windows_privilege::effective_system()
+                        && binding.name.eq_ignore_ascii_case("Winlogon")),
+                "当前进程无法访问 Windows 安全桌面，请以管理员身份启动共享"
+            );
+            ensure!(
+                SetThreadDesktop(desktop) != 0,
+                "无法切换 Windows 采集/输入线程桌面：{}",
+                std::io::Error::last_os_error()
+            );
+            Ok(binding)
+        }
+    }
+}
+impl Drop for DesktopBinding {
+    fn drop(&mut self) {
+        unsafe {
+            if SetThreadDesktop(self.previous) == 0 {
+                std::process::abort();
+            }
+            CloseDesktop(self.desktop);
+        }
+    }
+}
+fn desktop_name(desktop: HDESK) -> Result<String> {
+    let mut name = [0u16; 256];
+    let mut needed = 0;
+    ensure!(
+        unsafe {
+            GetUserObjectInformationW(
+                desktop,
+                UOI_NAME,
+                name.as_mut_ptr().cast(),
+                size_of_val(&name) as u32,
+                &mut needed,
+            )
+        } != 0,
+        "无法读取 Windows 桌面身份"
+    );
+    Ok(String::from_utf16_lossy(
+        &name[..name.iter().position(|c| *c == 0).unwrap_or(name.len())],
+    ))
+}
+pub(crate) fn current_desktop_name() -> Option<String> {
     unsafe {
         let desktop = OpenInputDesktop(0, 0, DESKTOP_READOBJECTS);
         if desktop.is_null() {
-            return false;
+            return None;
         }
-        let mut name = [0u16; 256];
-        let mut needed = 0;
-        let ok = GetUserObjectInformationW(
-            desktop,
-            UOI_NAME,
-            name.as_mut_ptr().cast(),
-            size_of_val(&name) as u32,
-            &mut needed,
-        );
+        let name = desktop_name(desktop).ok();
         CloseDesktop(desktop);
-        ok != 0
-            && String::from_utf16_lossy(
-                &name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())],
-            )
-            .eq_ignore_ascii_case("Default")
+        name
     }
+}
+fn desktop_available() -> bool {
+    current_desktop_name().is_some_and(|name| {
+        name.eq_ignore_ascii_case("Default")
+            || (crate::windows_privilege::effective_system()
+                && name.eq_ignore_ascii_case("Winlogon"))
+    })
 }
 
 pub struct CaptureSession {
     pub source: PreviewSource,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
-    input: Arc<Controller>,
 }
 impl Drop for CaptureSession {
     fn drop(&mut self) {
@@ -96,11 +163,10 @@ impl Drop for CaptureSession {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        self.input.stop();
     }
 }
 
-pub fn start(view_only: bool) -> Result<CaptureSession> {
+pub fn start(view_only: bool, experimental_lock_screen: bool) -> Result<CaptureSession> {
     let stop = Arc::new(AtomicBool::new(false));
     let input = Arc::new(Controller(Arc::new(Mutex::new(InputState::default()))));
     let (sender, frames) = watch::channel(None);
@@ -116,14 +182,20 @@ pub fn start(view_only: bool) -> Result<CaptureSession> {
             let dpi =
                 unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
             let initial = (|| -> Result<_> {
+                let identity = if experimental_lock_screen {
+                    Some(crate::windows_privilege::ThreadIdentity::enter()?)
+                } else {
+                    None
+                };
                 ensure!(!dpi.is_null(), "无法启用 Windows 物理像素坐标");
                 ensure!(
                     desktop_available(),
                     "请在已登录且解锁的 Windows 桌面启动服务"
                 );
-                desktop_rect()
+                let _desktop = DesktopBinding::open()?;
+                Ok((desktop_rect()?, identity))
             })();
-            let rect = match initial {
+            let (rect, _identity) = match initial {
                 Ok(value) => value,
                 Err(error) => {
                     let _ = init_tx.send(Err(format!("{error:#}")));
@@ -136,8 +208,11 @@ pub fn start(view_only: bool) -> Result<CaptureSession> {
             }
             let mut sequence = 0;
             let mut sharing = false;
+            let mut recovery =
+                crate::desktop_recovery::DesktopRecovery::new(experimental_lock_screen);
             while !stopped.load(Ordering::Acquire) {
                 if !capture_demand.is_active() {
+                    recovery.reset();
                     if sharing {
                         controller.stop();
                         sender.send_replace(None);
@@ -151,25 +226,33 @@ pub fn start(view_only: bool) -> Result<CaptureSession> {
                 let result = (|| -> Result<_> {
                     ensure!(
                         desktop_available(),
-                        "Windows 已锁屏或正在显示安全桌面；请在本机恢复桌面后重新连接"
+                        "Windows 当前桌面不可访问；请以管理员身份启动共享以访问锁屏"
                     );
+                    let binding = DesktopBinding::open()?;
                     let rect = desktop_rect()?;
                     let frame = capture(rect, sequence)?;
                     ensure!(
-                        desktop_available(),
-                        "Windows 桌面已切换，请恢复桌面后重新连接"
+                        current_desktop_name().as_deref() == Some(&binding.name),
+                        "Windows 桌面正在切换"
                     );
-                    Ok((rect, frame))
+                    Ok((rect, frame, binding.name.clone()))
                 })();
                 match result {
-                    Ok((rect, frame)) => {
-                        controller.record(sequence, rect);
+                    Ok((rect, frame, desktop)) => {
+                        recovery.reset();
+                        controller.record(sequence, rect, desktop);
                         sender.send_replace(Some(CaptureEvent::Frame(Arc::new(frame))));
                         sequence += 1;
                     }
                     Err(error) => {
                         controller.stop();
-                        sender.send_replace(Some(CaptureEvent::Stopped(format!("{error:#}"))));
+                        if recovery.retry(Instant::now()) {
+                            // None pauses this preview without sending an end marker.
+                            // Clear stale imagery and input until the new desktop is ready.
+                            sender.send_replace(None);
+                        } else {
+                            sender.send_replace(Some(CaptureEvent::Stopped(format!("{error:#}"))));
+                        }
                     }
                 }
                 std::thread::sleep(Duration::from_millis(100).saturating_sub(tick.elapsed()));
@@ -200,12 +283,148 @@ pub fn start(view_only: bool) -> Result<CaptureSession> {
             },
             frames,
             demand,
-            input: if view_only { None } else { Some(input.clone()) },
+            input: if view_only {
+                None
+            } else {
+                Some(Arc::new(ThreadController {
+                    controller: input,
+                    experimental_lock_screen,
+                }))
+            },
         },
         stop,
         worker: Some(worker),
-        input,
     })
+}
+
+// Only the worker below owns the real InputSession. Network threads exchange
+// bounded commands and never acquire SYSTEM impersonation or desktop handles.
+struct ThreadController {
+    controller: Arc<Controller>,
+    experimental_lock_screen: bool,
+}
+enum InputCommand {
+    Mouse(MouseEvent),
+    Key(KeyEvent),
+    ReleaseMouse,
+    ReleaseKeyboard,
+    ReleaseAll,
+}
+type InputRequest = (InputCommand, std::sync::mpsc::SyncSender<Result<()>>);
+struct ThreadSession {
+    sender: Option<std::sync::mpsc::SyncSender<InputRequest>>,
+    worker: Option<JoinHandle<()>>,
+}
+impl InputController for ThreadController {
+    fn acquire(&self) -> Result<Box<dyn InputSession>> {
+        let controller = self.controller.clone();
+        let experimental_lock_screen = self.experimental_lock_screen;
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<InputRequest>(8);
+        let (initialized, ready) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("windows-input".into())
+            .spawn(move || {
+                let setup = (|| -> Result<_> {
+                    let identity = if experimental_lock_screen {
+                        Some(crate::windows_privilege::ThreadIdentity::enter()?)
+                    } else {
+                        None
+                    };
+                    let desktop = DesktopBinding::open()?;
+                    let session = controller.acquire()?;
+                    Ok((identity, desktop, session))
+                })();
+                let (_identity, desktop, mut session) = match setup {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = initialized.send(Err(format!("{error:#}")));
+                        return;
+                    }
+                };
+                if initialized.send(Ok(())).is_err() {
+                    return;
+                }
+                // Keep the input queue attached between keydown/keyup events.
+                // Rebind only when the active desktop actually changes.
+                let mut desktop = Some(desktop);
+                while let Ok((command, reply)) = receiver.recv() {
+                    let result = (|| -> Result<()> {
+                        let current =
+                            current_desktop_name().context("Windows 当前输入桌面不可访问")?;
+                        if desktop.as_ref().is_none_or(|bound| bound.name != current) {
+                            desktop.take();
+                            desktop = Some(DesktopBinding::open()?);
+                        }
+                        match command {
+                            InputCommand::Mouse(event) => session.apply(event),
+                            InputCommand::Key(event) => session.apply_key(event),
+                            InputCommand::ReleaseMouse => {
+                                session.release_mouse();
+                                Ok(())
+                            }
+                            InputCommand::ReleaseKeyboard => {
+                                session.release_keyboard();
+                                Ok(())
+                            }
+                            InputCommand::ReleaseAll => {
+                                session.release_all();
+                                Ok(())
+                            }
+                        }
+                    })();
+                    let _ = reply.send(result);
+                }
+                // session releases all held input before the impersonation ends.
+                drop(session);
+                drop(desktop);
+            })
+            .context("无法启动 Windows 输入线程")?;
+        let session = ThreadSession {
+            sender: Some(sender),
+            worker: Some(worker),
+        };
+        ready
+            .recv()
+            .context("Windows 输入线程提前退出")?
+            .map_err(anyhow::Error::msg)?;
+        Ok(Box::new(session))
+    }
+}
+impl ThreadSession {
+    fn request(&self, command: InputCommand) -> Result<()> {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        self.sender
+            .as_ref()
+            .context("Windows 输入已结束")?
+            .send((command, reply))
+            .map_err(|_| anyhow::anyhow!("Windows 输入线程已停止"))?;
+        result.recv().context("Windows 输入线程未响应")?
+    }
+}
+impl InputSession for ThreadSession {
+    fn apply(&mut self, event: MouseEvent) -> Result<()> {
+        self.request(InputCommand::Mouse(event))
+    }
+    fn apply_key(&mut self, event: KeyEvent) -> Result<()> {
+        self.request(InputCommand::Key(event))
+    }
+    fn release_mouse(&mut self) {
+        let _ = self.request(InputCommand::ReleaseMouse);
+    }
+    fn release_keyboard(&mut self) {
+        let _ = self.request(InputCommand::ReleaseKeyboard);
+    }
+    fn release_all(&mut self) {
+        let _ = self.request(InputCommand::ReleaseAll);
+    }
+}
+impl Drop for ThreadSession {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 struct Surface {
@@ -234,7 +453,31 @@ impl Drop for Surface {
 }
 fn capture(rect: DesktopRect, sequence: u64) -> Result<PreviewFrame> {
     let (width, height) = rect.frame_size();
+    capture_sized(rect, sequence, width, height, false)
+}
+fn capture_sized(
+    rect: DesktopRect,
+    sequence: u64,
+    width: u32,
+    height: u32,
+    force_native: bool,
+) -> Result<PreviewFrame> {
     remote_protocol::validate_frame_size(width, height)?;
+    let native = force_native || (rect.width as u32, rect.height as u32) == (width, height);
+    let (dib_width, dib_height) = if native {
+        (rect.width, rect.height)
+    } else {
+        (width as i32, height as i32)
+    };
+    ensure!(dib_width > 0 && dib_height > 0, "Windows 桌面尺寸无效");
+    let byte_length = (dib_width as usize)
+        .checked_mul(dib_height as usize)
+        .and_then(|n| n.checked_mul(4))
+        .context("Windows 桌面尺寸溢出")?;
+    ensure!(
+        byte_length <= 256 * 1024 * 1024,
+        "Windows 原始桌面采集超过 256 MiB 上限"
+    );
     let mut surface = Surface {
         screen: null_mut(),
         memory: null_mut(),
@@ -250,8 +493,8 @@ fn capture(rect: DesktopRect, sequence: u64) -> Result<PreviewFrame> {
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: width as i32,
-                biHeight: -(height as i32),
+                biWidth: dib_width,
+                biHeight: -dib_height,
                 biPlanes: 1,
                 biBitCount: 32,
                 biCompression: BI_RGB,
@@ -278,7 +521,21 @@ fn capture(rect: DesktopRect, sequence: u64) -> Result<PreviewFrame> {
         ensure!(!surface.previous.is_null(), "无法选中采集位图");
         SetStretchBltMode(surface.memory, HALFTONE);
         SetBrushOrgEx(surface.memory, 0, 0, null_mut());
-        ensure!(
+        windows_sys::Win32::Foundation::SetLastError(0);
+        // Do not ask a locked display driver to stretch an equal-sized frame.
+        let copied = if native {
+            BitBlt(
+                surface.memory,
+                0,
+                0,
+                dib_width,
+                dib_height,
+                surface.screen,
+                rect.x,
+                rect.y,
+                SRCCOPY,
+            )
+        } else {
             StretchBlt(
                 surface.memory,
                 0,
@@ -290,22 +547,46 @@ fn capture(rect: DesktopRect, sequence: u64) -> Result<PreviewFrame> {
                 rect.y,
                 rect.width,
                 rect.height,
-                // CAPTUREBLT can hide/show the software cursor on every grab.
-                SRCCOPY
-            ) != 0,
-            "Windows 桌面采集失败"
-        );
+                SRCCOPY,
+            )
+        };
+        if copied == 0 {
+            let code = windows_sys::Win32::Foundation::GetLastError();
+            if !native {
+                drop(surface);
+                return capture_sized(rect, sequence, width, height, true).with_context(|| {
+                    format!("StretchBlt 失败（Win32={code}），原尺寸 BitBlt 后备采集也失败")
+                });
+            }
+            anyhow::bail!(
+                "Windows 桌面采集失败：BitBlt，Win32={}，源={}x{}@({}, {})，输出={}x{}，桌面={}，RASTERCAPS={:#x}",
+                code,
+                rect.width,
+                rect.height,
+                rect.x,
+                rect.y,
+                width,
+                height,
+                current_desktop_name().unwrap_or_else(|| "unavailable".into()),
+                GetDeviceCaps(surface.screen, RASTERCAPS as i32)
+            );
+        }
         ensure!(GdiFlush() != 0, "Windows 桌面像素同步失败");
     }
     // The selected top-down 32-bit DIB stays alive throughout JPEG encoding.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(pixels.cast::<u8>(), width as usize * height as usize * 4)
-    };
+    let bytes = unsafe { std::slice::from_raw_parts(pixels.cast::<u8>(), byte_length) };
+    let bytes = crate::bgra_resize::resize(
+        bytes,
+        dib_width as usize,
+        dib_height as usize,
+        width as usize,
+        height as usize,
+    )?;
     let mut jpeg = Vec::new();
     let mut encoder = jpeg_encoder::Encoder::new(&mut jpeg, 95);
     encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::R_4_4_4);
     encoder.encode(
-        bytes,
+        &bytes,
         width as u16,
         height as u16,
         jpeg_encoder::ColorType::Bgra,
@@ -329,12 +610,18 @@ struct InputState {
     held: [bool; 3],
     keys: BTreeSet<KeyCode>,
     frames: DesktopFrames,
+    desktop: String,
 }
 #[derive(Clone)]
 struct Controller(Arc<Mutex<InputState>>);
 impl Controller {
-    fn record(&self, sequence: u64, rect: DesktopRect) {
+    fn record(&self, sequence: u64, rect: DesktopRect, desktop: String) {
         let mut state = self.0.lock().unwrap();
+        if state.desktop != desktop {
+            release_all_inputs(&mut state);
+            state.frames.clear();
+            state.desktop = desktop;
+        }
         if state.frames.layout_changed(rect) {
             release_all_inputs(&mut state);
         }
@@ -373,6 +660,11 @@ impl InputSession for ControlSession {
     fn apply(&mut self, event: MouseEvent) -> Result<()> {
         let mut state = self.0.0.lock().unwrap();
         let result = (|| -> Result<()> {
+            let binding = DesktopBinding::open()?;
+            ensure!(
+                binding.name == state.desktop,
+                "Windows 桌面已切换，请等待新画面"
+            );
             ensure!(state.available && desktop_available(), "Windows 桌面已暂停");
             let rect = state
                 .frames
@@ -427,6 +719,11 @@ impl InputSession for ControlSession {
         let mut state = self.0.0.lock().unwrap();
         let result = (|| -> Result<()> {
             if event.down {
+                let binding = DesktopBinding::open()?;
+                ensure!(
+                    binding.name == state.desktop,
+                    "Windows 桌面已切换，请等待新画面"
+                );
                 ensure!(state.available && desktop_available(), "Windows 桌面已暂停");
                 let rect = state
                     .frames
@@ -501,6 +798,7 @@ fn release_mouse_buttons(state: &mut InputState) {
     }
 }
 fn send_mouse(flags: u32, data: u32, x: i32, y: i32) -> Result<()> {
+    let _desktop = DesktopBinding::open()?;
     let input = INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
@@ -516,29 +814,516 @@ fn send_mouse(flags: u32, data: u32, x: i32, y: i32) -> Result<()> {
     };
     ensure!(
         unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1,
-        "Windows 拒绝鼠标输入（不能控制权限更高的程序或安全桌面）"
+        "Windows 拒绝鼠标输入，请检查运行权限和系统策略"
     );
     Ok(())
 }
 
 fn send_key(key: KeyCode, down: bool) -> Result<()> {
-    let (virtual_key, extended) = crate::keyboard::windows_key(key);
+    let _desktop = DesktopBinding::open()?;
     let input = INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: virtual_key,
-                wScan: 0,
-                dwFlags: if extended { KEYEVENTF_EXTENDEDKEY } else { 0 }
-                    | if down { 0 } else { KEYEVENTF_KEYUP },
-                time: 0,
-                dwExtraInfo: 0,
-            },
+            ki: keyboard_input(key, down),
         },
     };
     ensure!(
         unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1,
-        "Windows 拒绝键盘输入（不能控制权限更高的程序或安全桌面）"
+        "Windows 拒绝键盘输入；线程模拟不保证能通过 UIPI，请查看单进程验证说明"
     );
     Ok(())
+}
+
+fn keyboard_input(key: KeyCode, down: bool) -> KEYBDINPUT {
+    let (virtual_key, extended) = crate::keyboard::windows_key(key);
+    let foreground = unsafe { GetForegroundWindow() };
+    let thread = if foreground.is_null() {
+        0
+    } else {
+        unsafe { GetWindowThreadProcessId(foreground, null_mut()) }
+    };
+    let layout = unsafe { GetKeyboardLayout(thread) };
+    let scan = unsafe { MapVirtualKeyExW(u32::from(virtual_key), MAPVK_VK_TO_VSC_EX, layout) };
+    // Pause uses an E1 multi-byte sequence; retain the virtual-key fallback for
+    // this special key and unmapped keys. Ordinary keys use physical scan codes.
+    let physical = scan != 0 && scan >> 8 != 0xe1 && key != KeyCode::Pause;
+    KEYBDINPUT {
+        wVk: if physical { 0 } else { virtual_key },
+        wScan: if physical { (scan & 0xff) as u16 } else { 0 },
+        dwFlags: if physical { KEYEVENTF_SCANCODE } else { 0 }
+            | if extended || scan >> 8 == 0xe0 {
+                KEYEVENTF_EXTENDEDKEY
+            } else {
+                0
+            }
+            | if down { 0 } else { KEYEVENTF_KEYUP },
+        time: 0,
+        dwExtraInfo: 0,
+    }
+}
+
+/// Native probe. The default mode never reads credentials. The explicitly
+/// gated disposable CI mode reads one fixture password from stdin and submits
+/// once. A SendInput return value alone never proves LogonUI processed input.
+pub fn probe(lock: bool, ci_unlock: bool, password_pipe: Option<String>) -> Result<()> {
+    let mut pipe = if let Some(name) = password_pipe {
+        ensure!(
+            ci_unlock
+                && std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+                && std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted"),
+            "测试管道只允许在一次性 GitHub runner 使用"
+        );
+        ensure!(
+            name.starts_with("myremoteapp-ci-")
+                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+            "无效的测试管道名称"
+        );
+        Some(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(format!("\\\\.\\pipe\\{name}"))?,
+        )
+    } else {
+        None
+    };
+    let result = probe_inner(lock, ci_unlock, pipe.as_mut());
+    if let Some(mut pipe) = pipe {
+        use std::io::Write;
+        let report = serde_json::json!({
+            "process_id": std::process::id(),
+            "actual_unlock_verified": ci_unlock && result.is_ok(),
+            "preview_continuity_verified": ci_unlock && result.is_ok(),
+            "locked_connect_verified": ci_unlock && result.is_ok(),
+            "native_copy_resize_verified": ci_unlock && result.is_ok(),
+            "error": result.as_ref().err().map(|error| format!("{error:#}")),
+        });
+        writeln!(pipe, "{report}")?;
+        pipe.flush()?;
+    }
+    result
+}
+fn probe_inner(lock: bool, ci_unlock: bool, mut pipe: Option<&mut std::fs::File>) -> Result<()> {
+    crate::windows_console::prepare()?;
+    let password = if ci_unlock {
+        ensure!(
+            std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+                && std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted"),
+            "真实解锁探测仅允许在一次性 GitHub-hosted runner 运行"
+        );
+        use std::io::Read;
+        let mut bytes = zeroize::Zeroizing::new(Vec::new());
+        if let Some(pipe) = pipe.as_mut() {
+            let mut size = [0u8; 4];
+            pipe.read_exact(&mut size)?;
+            let size = u32::from_le_bytes(size) as usize;
+            ensure!((4..=128).contains(&size), "临时测试凭据长度无效");
+            bytes.resize(size, 0);
+            pipe.read_exact(&mut bytes)?;
+        } else {
+            std::io::stdin().take(129).read_to_end(&mut bytes)?;
+        }
+        ensure!(
+            (4..=128).contains(&bytes.len())
+                && bytes
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || *b == b'!'),
+            "无效的临时测试凭据"
+        );
+        Some(bytes)
+    } else {
+        None
+    };
+    let process_id = std::process::id();
+    println!("single-process probe: pid={process_id}; lock={lock}");
+    std::thread::spawn(move || -> Result<()> {
+        let _identity = crate::windows_privilege::ThreadIdentity::enter().context("stage=thread_identity")?;
+        println!("stage=thread_identity effective_system={}", crate::windows_privilege::effective_system());
+        ensure!(crate::windows_privilege::effective_system(), "探测需要以管理员身份运行");
+        let capture_probe = || -> Result<()> {
+            let binding = DesktopBinding::open().context("stage=desktop_binding")?;
+            println!("stage=desktop_binding desktop={}", binding.name);
+            println!("stage=input_context {}", crate::windows_privilege::input_context().unwrap_or_else(|_| "unavailable".into()));
+            let rect = physical_desktop_rect()?;
+            let frame = capture(rect, 0).context("stage=capture")?;
+            let scaled_width = (frame.width / 2).max(1);
+            let scaled_height = (frame.height / 2).max(1);
+            let fallback = capture_sized(rect, 0, scaled_width, scaled_height, true).context("stage=native_copy_resize")?;
+            let decoded = crate::preview::decode(&fallback)?;
+            ensure!((decoded.width, decoded.height) == (scaled_width as usize, scaled_height as usize), "Native fallback dimensions are invalid");
+            println!("stage=native_copy_resize verified=true; dimensions={}x{}", decoded.width, decoded.height);
+            // Decode only in memory. Never upload a login-screen screenshot.
+            let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(&frame.jpeg));
+            let pixels = decoder.decode()?;
+            let low = pixels.iter().min().copied().unwrap_or(0);
+            let high = pixels.iter().max().copied().unwrap_or(0);
+            println!("stage=capture dimensions={}x{} pixel_range={low}..{high}", frame.width, frame.height);
+            ensure!(high.saturating_sub(low) > 2, "采集结果接近纯色，不能作为锁屏画面可用的证据");
+            let input = INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 { ki: KEYBDINPUT {
+                    wVk: VK_F24, wScan: 0, dwFlags: KEYEVENTF_KEYUP, time: 0, dwExtraInfo: 0,
+                } },
+            };
+            let impersonated = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+            println!("stage=input_api identity=thread key=F24 action=up accepted={impersonated}");
+            let _process_identity = crate::windows_privilege::ProcessIdentity::enter()?;
+            let accepted = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+            println!("stage=input_api identity=process key=F24 action=up accepted={accepted}; actual_unlock_verified=false");
+            ensure!(accepted == 1 || impersonated == 1, "SendInput 在两种身份下都拒绝输入；单进程当前桌面控制探测失败");
+            Ok(())
+        };
+        capture_probe().context("baseline desktop probe failed")?;
+        let capture = if ci_unlock { Some(start(true, true)?) } else { None };
+        let mut preview = capture.as_ref().map(|capture| CiPreview::start(capture.source.clone())).transpose()?;
+        if lock {
+            let requested = {
+                let _process_identity = crate::windows_privilege::ProcessIdentity::enter()?;
+                unsafe { windows_sys::Win32::System::Shutdown::LockWorkStation() }
+            };
+            ensure!(requested != 0,
+                "stage=lock_request failed: {}", std::io::Error::last_os_error());
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !current_desktop_name().is_some_and(|name| name.eq_ignore_ascii_case("Winlogon")) {
+                ensure!(Instant::now() < deadline, "stage=lock_wait: 未能访问 Winlogon 桌面，不能验证锁屏采集或输入");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            // Let LogonUI paint before sampling. This is not an unlock attempt.
+            std::thread::sleep(Duration::from_secs(2));
+            capture_probe().context("locked desktop probe failed")?;
+        }
+        // Also reproduce a fresh host/viewer starting while already locked.
+        let locked_capture = if ci_unlock { Some(start(true, true)?) } else { None };
+        let locked_preview = locked_capture.as_ref().map(|capture| CiPreview::start(capture.source.clone())).transpose()?;
+        ensure!(std::process::id() == process_id, "探测进程发生变化");
+        if let Some(password) = password {
+            verify_ci_unlock(&password)?;
+            if let Some(preview) = preview.take() { preview.verify_resumed()?; }
+            if let Some(preview) = locked_preview { preview.verify_resumed()?; }
+            println!("probe complete; actual_unlock_verified=true; preview_continuity_verified=true; fixture_credential_submitted_once=true");
+        } else {
+            println!("probe complete; no login credential was submitted; actual_unlock_verified=false");
+        }
+        Ok(())
+    }).join().map_err(|_| anyhow::anyhow!("Windows 探测线程异常退出"))?
+}
+
+// Observe the actual Windows capture backend through one preview protocol
+// session from before locking until after unlock. No reconnection is allowed.
+struct CiPreview {
+    sequence: Arc<std::sync::atomic::AtomicU64>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    worker: Option<JoinHandle<Result<()>>>,
+}
+impl CiPreview {
+    fn start(source: PreviewSource) -> Result<Self> {
+        let sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let latest = sequence.clone();
+        let (stop, mut shutdown) = tokio::sync::oneshot::channel();
+        let (ready, initialized) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async move {
+                let (mut client, mut server) = tokio::io::duplex(256 * 1024);
+                let host = tokio::spawn(async move { remote_session::serve_with_preview(&mut server, Some(source)).await });
+                let mut ready = Some(ready);
+                let result = async {
+                    remote_session::start_preview(&mut client).await?;
+                    loop {
+                        let frame = tokio::select! {
+                            _ = &mut shutdown => break,
+                            frame = tokio::time::timeout(remote_session::IO_TIMEOUT, remote_protocol::read_frame(&mut client)) => frame??,
+                        }.context("Preview ended during desktop transition; reconnect would be required")?;
+                        latest.store(frame.sequence, Ordering::Release);
+                        if let Some(ready) = ready.take() { let _ = ready.send(Ok(())); }
+                    }
+                    Ok(())
+                }.await;
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(Err(format!("{result:?}")));
+                }
+                host.abort();
+                let _ = host.await;
+                result
+            })
+        });
+        let preview = Self {
+            sequence,
+            stop: Some(stop),
+            worker: Some(worker),
+        };
+        initialized
+            .recv_timeout(remote_session::IO_TIMEOUT)
+            .context("Preview fixture did not receive its first frame")?
+            .map_err(anyhow::Error::msg)?;
+        Ok(preview)
+    }
+    fn verify_resumed(mut self) -> Result<()> {
+        // Demand genuinely newer captured frames; repeated heartbeat frames do
+        // not advance the sequence. Allow any in-flight lock-screen frame first.
+        let baseline = self.sequence.load(Ordering::Acquire);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.sequence.load(Ordering::Acquire) < baseline + 3 {
+            if self
+                .worker
+                .as_ref()
+                .is_some_and(|worker| worker.is_finished())
+            {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "No fresh desktop frames after unlock on the existing preview session"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        self.worker
+            .take()
+            .unwrap()
+            .join()
+            .map_err(|_| anyhow::anyhow!("Preview fixture worker failed"))??;
+        ensure!(
+            self.sequence.load(Ordering::Acquire) >= baseline + 3,
+            "Preview did not resume after unlock"
+        );
+        println!("stage=preview_continuity verified=true; preview_sessions=1; reconnected=false");
+        Ok(())
+    }
+}
+impl Drop for CiPreview {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+// Exercises the actual dedicated input worker and frame checks. Only the CI
+// fixture supplies a newly generated password over stdin; it is never logged.
+fn verify_ci_unlock(password: &[u8]) -> Result<()> {
+    ensure!(
+        current_desktop_name().as_deref() == Some("Winlogon"),
+        "解锁验收要求当前确实处于 Winlogon 桌面"
+    );
+    let controller = Arc::new(Controller(Arc::new(Mutex::new(InputState::default()))));
+    let rect = physical_desktop_rect()?;
+    controller.record(1, rect, "Winlogon".into());
+    let mut input = ThreadController {
+        controller,
+        experimental_lock_screen: true,
+    }
+    .acquire()?;
+    let mut key = |code, down| {
+        input.apply_key(KeyEvent {
+            frame_sequence: 1,
+            key: code,
+            down,
+        })
+    };
+    save_ci_login_screen("before-wake")?;
+    // Dismiss the clock/lock curtain; no credential has been typed yet.
+    key(KeyCode::Space, true)?;
+    key(KeyCode::Space, false)?;
+    std::thread::sleep(Duration::from_secs(2));
+    save_ci_login_screen("after-wake")?;
+    prepare_ci_password_field()?;
+    key(KeyCode::LeftCtrl, true)?;
+    key(KeyCode::A, true)?;
+    key(KeyCode::A, false)?;
+    key(KeyCode::LeftCtrl, false)?;
+    key(KeyCode::Backspace, true)?;
+    key(KeyCode::Backspace, false)?;
+    if unsafe { GetKeyState(VK_CAPITAL as i32) } & 1 != 0 {
+        key(KeyCode::CapsLock, true)?;
+        key(KeyCode::CapsLock, false)?;
+    }
+    for byte in password {
+        let (code, shift) = match byte {
+            b'a' => (KeyCode::A, false),
+            b'A' => (KeyCode::A, true),
+            b'b' => (KeyCode::B, false),
+            b'B' => (KeyCode::B, true),
+            b'c' => (KeyCode::C, false),
+            b'C' => (KeyCode::C, true),
+            b'd' => (KeyCode::D, false),
+            b'D' => (KeyCode::D, true),
+            b'e' => (KeyCode::E, false),
+            b'E' => (KeyCode::E, true),
+            b'f' => (KeyCode::F, false),
+            b'F' => (KeyCode::F, true),
+            b'0' => (KeyCode::Key0, false),
+            b'1' => (KeyCode::Key1, false),
+            b'2' => (KeyCode::Key2, false),
+            b'3' => (KeyCode::Key3, false),
+            b'4' => (KeyCode::Key4, false),
+            b'5' => (KeyCode::Key5, false),
+            b'6' => (KeyCode::Key6, false),
+            b'7' => (KeyCode::Key7, false),
+            b'8' => (KeyCode::Key8, false),
+            b'9' => (KeyCode::Key9, false),
+            b'!' => (KeyCode::Key1, true),
+            _ => anyhow::bail!("临时测试凭据包含不支持的字符"),
+        };
+        if shift {
+            key(KeyCode::LeftShift, true)?;
+        }
+        key(code, true)?;
+        key(code, false)?;
+        if shift {
+            key(KeyCode::LeftShift, false)?;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    // Exactly one submission; a failure does not retry the fixture password.
+    key(KeyCode::Enter, true)?;
+    key(KeyCode::Enter, false)?;
+    input.release_all();
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while current_desktop_name().as_deref() != Some("Default") {
+        ensure!(
+            Instant::now() < deadline,
+            "actual_unlock_verified=false：临时密码只提交了一次，登录界面未解锁；API 接受不等于输入生效"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    println!("stage=actual_unlock desktop=Default; verification=one_fixture_password_submission");
+    Ok(())
+}
+
+fn prepare_ci_password_field() -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn remote_ci_prepare_password_field(path: *const u16) -> i32;
+    }
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("RUNNER_TEMP").context("Missing runner temporary directory")?,
+    );
+    let path = directory.join(format!(
+        "myremoteapp-unlock-controls-{}.txt",
+        std::process::id()
+    ));
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // UIA may create hidden windows. Let its dedicated OS thread exit before
+    // closing the desktop, instead of trying to rebind a thread with windows.
+    let (result, desktop) = std::thread::spawn(move || -> Result<(i32, usize)> {
+        let desktop = unsafe {
+            OpenInputDesktop(
+                0,
+                0,
+                DESKTOP_READOBJECTS
+                    | DESKTOP_WRITEOBJECTS
+                    | DESKTOP_SWITCHDESKTOP
+                    | DESKTOP_CREATEWINDOW
+                    | DESKTOP_JOURNALPLAYBACK,
+            )
+        };
+        ensure!(!desktop.is_null(), "Unable to open CI login desktop");
+        if unsafe { SetThreadDesktop(desktop) } == 0 {
+            unsafe {
+                CloseDesktop(desktop);
+            }
+            anyhow::bail!("Unable to bind CI login desktop");
+        }
+        let result = unsafe { remote_ci_prepare_password_field(path.as_ptr()) };
+        Ok((result, desktop as usize))
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("CI login UI thread exited unexpectedly"))??;
+    unsafe {
+        CloseDesktop(desktop as HDESK);
+    }
+    ensure!(
+        result >= 0,
+        "CI password field is not available/focused: HRESULT={result:#x}; no password was submitted"
+    );
+    Ok(())
+}
+
+// Capture only BEFORE the fixture types its generated password. Never called
+// by ordinary serve/connect; these images identify the disposable login UI.
+fn save_ci_login_screen(stage: &str) -> Result<()> {
+    use std::io::Write;
+    ensure!(
+        std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+            && std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted"),
+        "CI fixture only"
+    );
+    let _desktop = DesktopBinding::open()?;
+    let frame = capture(physical_desktop_rect()?, 0)?;
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("RUNNER_TEMP").context("Missing runner temporary directory")?,
+    );
+    let path = directory.join(format!(
+        "myremoteapp-unlock-{stage}-{}.jpg",
+        std::process::id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(&frame.jpeg)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn physical_keys_keep_extended_and_release_flags() {
+        for (key, scan, extended) in [
+            (KeyCode::Enter, 0x1c, false),
+            (KeyCode::NumPadEnter, 0x1c, true),
+            (KeyCode::RightCtrl, 0x1d, true),
+            (KeyCode::LeftShift, 0x2a, false),
+        ] {
+            let down = keyboard_input(key, true);
+            let up = keyboard_input(key, false);
+            assert_eq!(down.wVk, 0);
+            assert_eq!(down.wScan, scan);
+            assert_ne!(down.dwFlags & KEYEVENTF_SCANCODE, 0);
+            assert_eq!(down.dwFlags & KEYEVENTF_EXTENDEDKEY != 0, extended);
+            assert_eq!(up.dwFlags, down.dwFlags | KEYEVENTF_KEYUP);
+        }
+    }
+    #[test]
+    fn released_key_after_transition_does_not_require_an_old_desktop_frame() {
+        let controller = Controller(Arc::new(Mutex::new(InputState::default())));
+        let mut session = ControlSession(controller);
+        session
+            .apply_key(KeyEvent {
+                frame_sequence: u64::MAX,
+                key: KeyCode::Enter,
+                down: false,
+            })
+            .unwrap();
+    }
+    #[test]
+    fn desktop_transition_invalidates_same_size_old_frames() {
+        let controller = Controller(Arc::new(Mutex::new(InputState::default())));
+        let rect = DesktopRect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        controller.record(1, rect, "Default".into());
+        controller.record(2, rect, "Winlogon".into());
+        let state = controller.0.lock().unwrap();
+        assert_eq!(state.frames.get(1), None);
+        assert_eq!(state.frames.get(2), Some(rect));
+        drop(state);
+        controller.record(3, rect, "Default".into());
+        let state = controller.0.lock().unwrap();
+        assert_eq!(state.frames.get(2), None);
+        assert_eq!(state.frames.get(3), Some(rect));
+    }
 }
