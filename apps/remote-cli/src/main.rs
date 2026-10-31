@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "windows", test))]
+mod bgra_resize;
 #[cfg(any(target_os = "macos", test))]
 mod capture_readiness;
 #[cfg(any(target_os = "windows", test))]

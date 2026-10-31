@@ -71,6 +71,8 @@ try {
     if ($report.process_id -eq $process.Id) { throw 'Self-restart did not create a replacement.' }
     if (-not $report.actual_unlock_verified) { throw 'Actual password submission did not unlock the Windows session.' }
     if (-not $report.preview_continuity_verified) { throw 'Preview session did not survive unlock.' }
+    if (-not $report.locked_connect_verified) { throw 'Fresh connection while locked did not deliver frames.' }
+    if (-not $report.native_copy_resize_verified) { throw 'Native BitBlt capture and CPU resize verification failed.' }
     Write-Host 'Original process exited; actual password unlock succeeded and the existing preview resumed without reconnecting.'
 } finally {
     $pipe.Dispose()

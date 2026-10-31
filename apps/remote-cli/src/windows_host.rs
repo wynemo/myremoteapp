@@ -453,7 +453,31 @@ impl Drop for Surface {
 }
 fn capture(rect: DesktopRect, sequence: u64) -> Result<PreviewFrame> {
     let (width, height) = rect.frame_size();
+    capture_sized(rect, sequence, width, height, false)
+}
+fn capture_sized(
+    rect: DesktopRect,
+    sequence: u64,
+    width: u32,
+    height: u32,
+    force_native: bool,
+) -> Result<PreviewFrame> {
     remote_protocol::validate_frame_size(width, height)?;
+    let native = force_native || (rect.width as u32, rect.height as u32) == (width, height);
+    let (dib_width, dib_height) = if native {
+        (rect.width, rect.height)
+    } else {
+        (width as i32, height as i32)
+    };
+    ensure!(dib_width > 0 && dib_height > 0, "Windows 桌面尺寸无效");
+    let byte_length = (dib_width as usize)
+        .checked_mul(dib_height as usize)
+        .and_then(|n| n.checked_mul(4))
+        .context("Windows 桌面尺寸溢出")?;
+    ensure!(
+        byte_length <= 256 * 1024 * 1024,
+        "Windows 原始桌面采集超过 256 MiB 上限"
+    );
     let mut surface = Surface {
         screen: null_mut(),
         memory: null_mut(),
@@ -469,8 +493,8 @@ fn capture(rect: DesktopRect, sequence: u64) -> Result<PreviewFrame> {
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: width as i32,
-                biHeight: -(height as i32),
+                biWidth: dib_width,
+                biHeight: -dib_height,
                 biPlanes: 1,
                 biBitCount: 32,
                 biCompression: BI_RGB,
@@ -497,7 +521,21 @@ fn capture(rect: DesktopRect, sequence: u64) -> Result<PreviewFrame> {
         ensure!(!surface.previous.is_null(), "无法选中采集位图");
         SetStretchBltMode(surface.memory, HALFTONE);
         SetBrushOrgEx(surface.memory, 0, 0, null_mut());
-        ensure!(
+        windows_sys::Win32::Foundation::SetLastError(0);
+        // Do not ask a locked display driver to stretch an equal-sized frame.
+        let copied = if native {
+            BitBlt(
+                surface.memory,
+                0,
+                0,
+                dib_width,
+                dib_height,
+                surface.screen,
+                rect.x,
+                rect.y,
+                SRCCOPY,
+            )
+        } else {
             StretchBlt(
                 surface.memory,
                 0,
@@ -509,22 +547,46 @@ fn capture(rect: DesktopRect, sequence: u64) -> Result<PreviewFrame> {
                 rect.y,
                 rect.width,
                 rect.height,
-                // CAPTUREBLT can hide/show the software cursor on every grab.
-                SRCCOPY
-            ) != 0,
-            "Windows 桌面采集失败"
-        );
+                SRCCOPY,
+            )
+        };
+        if copied == 0 {
+            let code = windows_sys::Win32::Foundation::GetLastError();
+            if !native {
+                drop(surface);
+                return capture_sized(rect, sequence, width, height, true).with_context(|| {
+                    format!("StretchBlt 失败（Win32={code}），原尺寸 BitBlt 后备采集也失败")
+                });
+            }
+            anyhow::bail!(
+                "Windows 桌面采集失败：BitBlt，Win32={}，源={}x{}@({}, {})，输出={}x{}，桌面={}，RASTERCAPS={:#x}",
+                code,
+                rect.width,
+                rect.height,
+                rect.x,
+                rect.y,
+                width,
+                height,
+                current_desktop_name().unwrap_or_else(|| "unavailable".into()),
+                GetDeviceCaps(surface.screen, RASTERCAPS as i32)
+            );
+        }
         ensure!(GdiFlush() != 0, "Windows 桌面像素同步失败");
     }
     // The selected top-down 32-bit DIB stays alive throughout JPEG encoding.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(pixels.cast::<u8>(), width as usize * height as usize * 4)
-    };
+    let bytes = unsafe { std::slice::from_raw_parts(pixels.cast::<u8>(), byte_length) };
+    let bytes = crate::bgra_resize::resize(
+        bytes,
+        dib_width as usize,
+        dib_height as usize,
+        width as usize,
+        height as usize,
+    )?;
     let mut jpeg = Vec::new();
     let mut encoder = jpeg_encoder::Encoder::new(&mut jpeg, 95);
     encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::R_4_4_4);
     encoder.encode(
-        bytes,
+        &bytes,
         width as u16,
         height as u16,
         jpeg_encoder::ColorType::Bgra,
@@ -832,6 +894,8 @@ pub fn probe(lock: bool, ci_unlock: bool, password_pipe: Option<String>) -> Resu
             "process_id": std::process::id(),
             "actual_unlock_verified": ci_unlock && result.is_ok(),
             "preview_continuity_verified": ci_unlock && result.is_ok(),
+            "locked_connect_verified": ci_unlock && result.is_ok(),
+            "native_copy_resize_verified": ci_unlock && result.is_ok(),
             "error": result.as_ref().err().map(|error| format!("{error:#}")),
         });
         writeln!(pipe, "{report}")?;
@@ -881,6 +945,12 @@ fn probe_inner(lock: bool, ci_unlock: bool, mut pipe: Option<&mut std::fs::File>
             println!("stage=input_context {}", crate::windows_privilege::input_context().unwrap_or_else(|_| "unavailable".into()));
             let rect = physical_desktop_rect()?;
             let frame = capture(rect, 0).context("stage=capture")?;
+            let scaled_width = (frame.width / 2).max(1);
+            let scaled_height = (frame.height / 2).max(1);
+            let fallback = capture_sized(rect, 0, scaled_width, scaled_height, true).context("stage=native_copy_resize")?;
+            let decoded = crate::preview::decode(&fallback)?;
+            ensure!((decoded.width, decoded.height) == (scaled_width as usize, scaled_height as usize), "Native fallback dimensions are invalid");
+            println!("stage=native_copy_resize verified=true; dimensions={}x{}", decoded.width, decoded.height);
             // Decode only in memory. Never upload a login-screen screenshot.
             let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(&frame.jpeg));
             let pixels = decoder.decode()?;
@@ -921,10 +991,14 @@ fn probe_inner(lock: bool, ci_unlock: bool, mut pipe: Option<&mut std::fs::File>
             std::thread::sleep(Duration::from_secs(2));
             capture_probe().context("locked desktop probe failed")?;
         }
+        // Also reproduce a fresh host/viewer starting while already locked.
+        let locked_capture = if ci_unlock { Some(start(true, true)?) } else { None };
+        let locked_preview = locked_capture.as_ref().map(|capture| CiPreview::start(capture.source.clone())).transpose()?;
         ensure!(std::process::id() == process_id, "探测进程发生变化");
         if let Some(password) = password {
             verify_ci_unlock(&password)?;
             if let Some(preview) = preview.take() { preview.verify_resumed()?; }
+            if let Some(preview) = locked_preview { preview.verify_resumed()?; }
             println!("probe complete; actual_unlock_verified=true; preview_continuity_verified=true; fixture_credential_submitted_once=true");
         } else {
             println!("probe complete; no login credential was submitted; actual_unlock_verified=false");
