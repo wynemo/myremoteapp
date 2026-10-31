@@ -38,7 +38,9 @@ cargo run --locked --release -- serve --virtual-display
 
 默认模式遇到锁屏或 UAC 安全桌面会暂停。暂不支持 Windows 单窗口选择、Ctrl+Alt+Del 登录策略、BitLocker 或重启后自动运行；PIN 和多屏行为尚待实机验收。
 
-当前不支持“无显示器、从 RDP 启动后再断开 RDP”的独立运行：程序仍绑定原 RDP 会话，显示面失效时无法采集。Windows 持久虚拟显示及跨会话处理尚未实现。
+无实体显示器时，保持 HDMI 显示模拟器插入。若从 RDP 启动服务端，退出时在管理员 PowerShell 用 `query session` 查询当前 RDP 会话 ID，再运行 `tscon.exe <会话ID> /dest:console`，将会话交给控制台；该操作立即断开 RDP，并可能保留已解锁状态。此方案已在目标 Windows 实机验证连接、锁屏、密码解锁和原画面自动恢复，无需安装驱动。不要固定使用某个会话 ID。
+
+无有效显示输出或直接断开原 RDP 会话的场景仍不受支持。Windows 持久虚拟显示及自动会话交接尚未实现。
 
 ## 客户端：打开画面
 
