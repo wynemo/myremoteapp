@@ -8,28 +8,28 @@
 
 2026-10-31，目标 Windows 实机已验证：保持 HDMI 显示模拟器插入，将 RDP 会话交给控制台后，本程序恢复连接；随后通过本程序锁屏、手动输入密码解锁，原窗口自动恢复画面，无需重连。该验证来自用户实际设备反馈，不是仅由 CI 推断。
 
-从 RDP 启动服务端时，先运行 `query session` 找到属于当前用户的 RDP 会话 ID。在管理员 PowerShell 执行：
+从 RDP 的管理员 PowerShell 启动：
 
 ```powershell
-& "$env:WINDIR\System32\tscon.exe" <实际RDP会话ID> /dest:console
+.\remote-cli.exe serve --desktop --experimental-lock-screen
 ```
 
-这会立即断开 RDP，将该会话的输出交给控制台，保留会话内正在运行的程序；可能保留当前已解锁状态。随后用本程序连接并按需锁屏、解锁。实机验证时会话 ID 为 2，但以后可能变化，不能把 2 写死。显示模拟器必须保持插入；无需安装新增显示驱动或本程序系统服务。
+SYSTEM 替代进程在监听网络和创建采集线程之前，动态读取自己的会话 ID、显示协议和活动控制台 ID。已在控制台时直接继续；在 RDP 会话时，先锁定当前会话，通过 `WTSConnectSessionW` 将输出交给控制台，等待当前会话成为活动控制台，再确认锁屏后接受连接。RDP 会断开，原会话里的程序继续运行；无需手动执行 `query session` 或 `tscon`。该步骤不创建额外进程、服务、计划任务或驱动，也不读取用户密码。交接权限仅在自己的 SYSTEM 令牌临时启用，调用后恢复。
 
-参考：[微软的 UI 会话保留说明](https://learn.microsoft.com/azure/devops/pipelines/test/ui-testing-considerations)。程序当前没有自动执行该交接，也不会静默切换会话。
+会话 ID 不固定；Session 0、未知协议、控制台切换中、交接失败或无法确认锁屏时明确报错，不启动共享。显示器或 HDMI 模拟器必须保持连接。普通模式不执行会话交接。
 
-### 部署限制：无有效显示输出与直接断开 RDP
+自动路径使用微软的 [WTSConnectSessionW](https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/nf-wtsapi32-wtsconnectsessionw)，对应此前已在目标机器验证的 `tscon.exe <当前RDP会话ID> /dest:console` 操作。此前的实机验收覆盖手动交接、锁屏、密码输入和原连接恢复；自动交接本身仍需目标 Windows 设备复测。Windows CI 验证控制台启动路径及真实密码解锁，不冒充 RDP 实机交接验收。
 
-已收到真实设备反馈：没有实体显示器，通过微软 RDP 启动服务端，再断开 RDP 后，在 Winlogon 上 BitBlt 返回 Win32=6。程序目前保留启动时的会话，不会自动迁移到控制台，也没有提供持久 Windows 虚拟显示设备。此部署方式当前不能独立远控或解锁；前面的有显示面 CI 结果不覆盖它。
+### 部署限制：无有效显示输出
 
-RDP 会话与控制台使用不同的显示输出。长期支持该场景需要明确处理会话连接和持续显示输出；候选路线包括持久虚拟显示驱动，或实体/模拟显示器结合控制台会话。程序未自动安装驱动或更改用户机器的显示配置；上面的已验证会话交接由用户手动执行。参考：[微软关于远程与控制台终端的说明](https://learn.microsoft.com/en-us/windows/win32/termserv/consoles-vs-terminals)。
+已收到真实设备反馈：通过微软 RDP 启动后直接断开，Winlogon 上 BitBlt 返回 Win32=6。RDP 与控制台使用不同的显示输出；HDMI 模拟器需要配合会话交接，不能让程序留在断开的 RDP 会话。自动交接不会创建显示设备；完全没有实体或模拟显示器的场景仍不受支持。参考：[微软关于远程与控制台终端的说明](https://learn.microsoft.com/en-us/windows/win32/termserv/consoles-vs-terminals)。
 
 ### 在已有有效显示面的会话运行
 
 先停止 Windows 上的旧程序，在管理员 PowerShell 下载已通过真实密码解锁验证的版本：
 
 ```powershell
-python download_windows.py --run-id 41157923196 --force
+python download_windows.py --run-id 41163225357 --force
 .\remote-cli.exe serve --desktop --experimental-lock-screen
 ```
 
@@ -38,6 +38,10 @@ python download_windows.py --run-id 41157923196 --force
 不加 `--experimental-lock-screen` 时仍使用普通用户进程模式，遇到锁屏或 UAC 安全桌面暂停。要求 Ctrl+Alt+Del 的登录策略、Windows Hello/PIN、跨登录会话、退出登录、重启或 BitLocker 解锁不在本次验收范围内。该参数保留实验标记，仍需在目标 Windows 版本复测。
 
 ## 已完成的验证
+
+自动交接版本提交 `1a8b56b` 已通过 [Windows CI run 41163225357](https://github.com/wynemo/myremoteapp/actions/runs/41163225357/job/124425141320)：原生 Release / `--locked` 构建、Clippy 和全部测试通过。SYSTEM 探针运行新的控制台准备入口后，完成真实密码解锁、锁屏新连接、原连接恢复及 BitBlt/CPU 缩放检查，四个报告字段均为 `true`。该 runner 位于控制台，未覆盖真实 RDP 到控制台的 API 分支。本机 macOS / 共享模块的 Release 测试和 Clippy 另行通过，未在 macOS 交叉编译 Windows。
+
+以下保留此前采集与解锁验证的细节：
 
 [Windows CI run 41157923196](https://github.com/wynemo/myremoteapp/actions/runs/41157923196/job/124408750699) 在提交 `757660b` 上原生完成 Release / `--locked` 构建、测试和 Clippy；随后完成真实密码解锁：
 

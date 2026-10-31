@@ -34,13 +34,13 @@ cargo run --locked --release -- serve --virtual-display
 
 不加 `--desktop` 也默认共享整个桌面；只观看可加 `--view-only`。允许 Windows 防火墙访问监听端口 9443，将 `.local\host\connect.json` 复制到客户端当前目录，使用该 Windows 的 IP 连接。
 
-需要锁屏输入时，改在管理员 PowerShell 运行 `serve --desktop --experimental-lock-screen`。程序会在新窗口以 SYSTEM 身份重启自身，原进程退出，运行中只保留一个远控进程；不安装系统服务。在新窗口按 Ctrl+C 停止。新版 EXE 和完整步骤见 [Windows 锁屏说明](docs/windows-lock-screen.md)，正常解锁后画面在原连接中自动恢复，无需再连接。已通过 Windows CI 真实密码解锁及同一预览连接恢复测试，并在下述 HDMI 模拟器方案中通过实机验收。
+需要锁屏输入时，改在管理员 PowerShell 运行 `serve --desktop --experimental-lock-screen`。程序会在新窗口以 SYSTEM 身份重启自身，原进程退出，运行中只保留一个远控进程；不安装系统服务。在新窗口按 Ctrl+C 停止。新版 EXE 和完整步骤见 [Windows 锁屏说明](docs/windows-lock-screen.md)，正常解锁后画面在原连接中自动恢复，无需再连接。已通过 Windows CI 真实密码解锁及同一预览连接恢复测试；HDMI 模拟器下的手动会话交接已通过实机验收，新增自动交接仍需实机复测。
 
 默认模式遇到锁屏或 UAC 安全桌面会暂停。暂不支持 Windows 单窗口选择、Ctrl+Alt+Del 登录策略、BitLocker 或重启后自动运行；PIN 和多屏行为尚待实机验收。
 
-无实体显示器时，保持 HDMI 显示模拟器插入。若从 RDP 启动服务端，退出时在管理员 PowerShell 用 `query session` 查询当前 RDP 会话 ID，再运行 `tscon.exe <会话ID> /dest:console`，将会话交给控制台；该操作立即断开 RDP，并可能保留已解锁状态。此方案已在目标 Windows 实机验证连接、锁屏、密码解锁和原画面自动恢复，无需安装驱动。不要固定使用某个会话 ID。
+无实体显示器时，保持 HDMI 显示模拟器插入。从 RDP 的管理员 PowerShell 启动锁屏模式后，程序自动将当前会话交给控制台并确认锁屏，RDP 会断开；随后用本程序连接并输入 Windows 密码，无需手动执行会话交接命令。已有程序和配对文件保留，不安装驱动。
 
-无有效显示输出或直接断开原 RDP 会话的场景仍不受支持。Windows 持久虚拟显示及自动会话交接尚未实现。
+无有效显示输出仍不受支持；Windows 持久虚拟显示尚未实现。普通模式不自动交接 RDP 会话。
 
 ## 客户端：打开画面
 
