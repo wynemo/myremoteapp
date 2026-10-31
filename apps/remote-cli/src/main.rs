@@ -19,6 +19,8 @@ mod preview;
 #[cfg(target_os = "macos")]
 mod unlock_macos;
 #[cfg(target_os = "windows")]
+mod windows_console;
+#[cfg(target_os = "windows")]
 mod windows_host;
 #[cfg(target_os = "windows")]
 mod windows_privilege;
@@ -254,6 +256,10 @@ async fn main() -> Result<()> {
             #[cfg(target_os = "windows")]
             if experimental_lock_screen && windows_privilege::restart_as_system()? {
                 return Ok(());
+            }
+            #[cfg(target_os = "windows")]
+            if experimental_lock_screen {
+                windows_console::prepare()?;
             }
             let listener = TcpListener::bind(&listen).await?;
             #[cfg(target_os = "macos")]

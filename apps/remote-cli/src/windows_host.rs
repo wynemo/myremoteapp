@@ -133,7 +133,7 @@ fn desktop_name(desktop: HDESK) -> Result<String> {
         &name[..name.iter().position(|c| *c == 0).unwrap_or(name.len())],
     ))
 }
-fn current_desktop_name() -> Option<String> {
+pub(crate) fn current_desktop_name() -> Option<String> {
     unsafe {
         let desktop = OpenInputDesktop(0, 0, DESKTOP_READOBJECTS);
         if desktop.is_null() {
@@ -904,6 +904,7 @@ pub fn probe(lock: bool, ci_unlock: bool, password_pipe: Option<String>) -> Resu
     result
 }
 fn probe_inner(lock: bool, ci_unlock: bool, mut pipe: Option<&mut std::fs::File>) -> Result<()> {
+    crate::windows_console::prepare()?;
     let password = if ci_unlock {
         ensure!(
             std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
