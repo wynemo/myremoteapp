@@ -372,10 +372,35 @@ impl KeyboardQueue {
     }
 }
 
+/// Physical key state used to resync after the viewer window regains focus.
+/// `None` means the platform cannot be asked; the stale block is then dropped
+/// rather than risking a keyboard that stays dead until reconnecting.
+#[cfg(target_os = "macos")]
+pub fn key_still_down(key: KeyCode) -> Option<bool> {
+    Some(unsafe { remote_physical_key_down(macos_key(key)?) })
+}
+#[cfg(target_os = "windows")]
+pub fn key_still_down(key: KeyCode) -> Option<bool> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    let (virtual_key, _) = windows_key(key);
+    Some(unsafe { GetAsyncKeyState(i32::from(virtual_key)) } < 0)
+}
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn key_still_down(_key: KeyCode) -> Option<bool> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    /// HID-level state; independent of window focus and local monitors.
+    fn remote_physical_key_down(key: u16) -> bool;
+}
+
 #[derive(Default)]
 pub struct KeyboardTracker {
     held: BTreeSet<KeyCode>,
     blocked: BTreeSet<KeyCode>,
+    focused: bool,
 }
 impl KeyboardTracker {
     pub fn update(
@@ -383,8 +408,29 @@ impl KeyboardTracker {
         events: Vec<(KeyCode, bool)>,
         active: bool,
         sequence: u64,
+        key_still_down: impl Fn(KeyCode) -> Option<bool>,
     ) -> Vec<Message> {
         let mut output = Vec::new();
+        if active && !self.focused {
+            // Releases that happen while the viewer window is unfocused never
+            // reach the local monitor, so a modifier held across a focus change
+            // (Cmd-Tab away and back while typing) would stay blocked and
+            // swallow every later key until the client reconnects. Resync
+            // instead: the host already released everything on focus loss, so
+            // press again what is still physically held and forget the rest.
+            for key in std::mem::take(&mut self.blocked) {
+                if key_still_down(key) == Some(true) && self.held.insert(key) {
+                    output.push(Message::Key {
+                        event: KeyEvent {
+                            frame_sequence: sequence,
+                            key,
+                            down: true,
+                        },
+                    });
+                }
+            }
+        }
+        self.focused = active;
         if !active && !self.held.is_empty() {
             self.blocked.append(&mut self.held);
             output.push(Message::ReleaseKeyboard);
@@ -438,6 +484,10 @@ mod tests {
             },
         }
     }
+    /// Nothing is physically held in the plain tracking tests.
+    fn released(_key: KeyCode) -> Option<bool> {
+        Some(false)
+    }
     #[test]
     fn quick_taps_and_chords_preserve_event_order() {
         let mut tracker = KeyboardTracker::default();
@@ -450,7 +500,7 @@ mod tests {
             (KeyCode::Escape, false),
         ];
         let expected: Vec<_> = input.iter().map(|&(key, down)| event(key, down)).collect();
-        assert_eq!(tracker.update(input, true, 7), expected);
+        assert_eq!(tracker.update(input, true, 7, released), expected);
     }
     #[test]
     fn repeats_text_keys_but_not_modifiers_or_lock_toggles() {
@@ -467,7 +517,8 @@ mod tests {
                     (KeyCode::CapsLock, true)
                 ],
                 true,
-                7
+                7,
+                released
             ),
             vec![
                 event(KeyCode::LeftShift, true),
@@ -479,33 +530,68 @@ mod tests {
         );
     }
     #[test]
-    fn focus_loss_releases_and_does_not_repress_held_modifiers() {
+    fn focus_loss_releases_and_represses_a_still_held_modifier() {
         let mut tracker = KeyboardTracker::default();
-        tracker.update(vec![(KeyCode::LeftCtrl, true)], true, 7);
+        tracker.update(vec![(KeyCode::LeftCtrl, true)], true, 7, released);
         assert_eq!(
-            tracker.update(vec![], false, 7),
+            tracker.update(vec![], false, 7, released),
             vec![Message::ReleaseKeyboard]
         );
-        assert!(tracker.update(vec![], false, 7).is_empty());
-        assert!(
-            tracker
-                .update(vec![(KeyCode::LeftCtrl, true)], true, 7)
-                .is_empty()
-        );
-        assert!(
-            tracker
-                .update(vec![(KeyCode::A, true), (KeyCode::A, false)], true, 7)
-                .is_empty(),
-            "do not turn a chord with a blocked modifier into plain text"
-        );
-        assert!(
-            tracker
-                .update(vec![(KeyCode::LeftCtrl, false)], true, 7)
-                .is_empty()
+        assert!(tracker.update(vec![], false, 7, released).is_empty());
+        // Ctrl is still held when focus returns. The host released it on focus
+        // loss, so it has to be pressed again for the chord to arrive.
+        let held = |key| Some(key == KeyCode::LeftCtrl);
+        assert_eq!(
+            tracker.update(vec![(KeyCode::LeftCtrl, true)], true, 7, held),
+            vec![event(KeyCode::LeftCtrl, true)]
         );
         assert_eq!(
-            tracker.update(vec![(KeyCode::LeftCtrl, true)], true, 7),
-            vec![event(KeyCode::LeftCtrl, true)]
+            tracker.update(vec![(KeyCode::A, true), (KeyCode::A, false)], true, 7, held),
+            vec![event(KeyCode::A, true), event(KeyCode::A, false)],
+            "the chord must reach the host instead of plain text or nothing"
+        );
+        assert_eq!(
+            tracker.update(vec![(KeyCode::LeftCtrl, false)], true, 7, released),
+            vec![event(KeyCode::LeftCtrl, false)]
+        );
+    }
+    #[test]
+    fn modifier_released_while_unfocused_does_not_dead_lock_the_keyboard() {
+        let mut tracker = KeyboardTracker::default();
+        // Command held, then the viewer loses focus (Cmd-Tab to another app).
+        tracker.update(vec![(KeyCode::LeftSuper, true)], true, 7, released);
+        assert_eq!(
+            tracker.update(vec![], false, 7, released),
+            vec![Message::ReleaseKeyboard]
+        );
+        // The release itself happens in the other app and never reaches this
+        // window. After focus returns every keystroke must work again instead of
+        // staying dead until the client reconnects.
+        for _ in 0..3 {
+            assert_eq!(
+                tracker.update(
+                    vec![(KeyCode::A, true), (KeyCode::A, false)],
+                    true,
+                    7,
+                    released
+                ),
+                vec![event(KeyCode::A, true), event(KeyCode::A, false)]
+            );
+        }
+    }
+    #[test]
+    fn unknown_physical_state_resyncs_instead_of_blocking() {
+        let mut tracker = KeyboardTracker::default();
+        tracker.update(vec![(KeyCode::LeftShift, true)], true, 7, released);
+        tracker.update(vec![], false, 7, released);
+        assert_eq!(
+            tracker.update(
+                vec![(KeyCode::A, true), (KeyCode::A, false)],
+                true,
+                7,
+                |_| None
+            ),
+            vec![event(KeyCode::A, true), event(KeyCode::A, false)]
         );
     }
     #[test]

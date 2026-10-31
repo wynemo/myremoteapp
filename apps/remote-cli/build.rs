@@ -18,6 +18,7 @@ fn main() {
             .file("native/workspace_macos.m")
             .flag("-fobjc-arc")
             .compile("remote_preview_macos");
+        println!("cargo:rustc-link-lib=framework=CoreGraphics");
         println!("cargo:rustc-link-lib=framework=QuartzCore");
         // ScreenCaptureKit's bridge uses the Swift concurrency runtime shipped
         // with macOS. Resolve it without requiring Xcode on the user's machine.

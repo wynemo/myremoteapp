@@ -1,4 +1,5 @@
 #import <Cocoa/Cocoa.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import <QuartzCore/QuartzCore.h>
 #include <stdbool.h>
 
@@ -182,6 +183,13 @@ void remote_preview_keyboard_enabled(void *handle, bool enabled) {
                 return event;
             }];
     }
+}
+
+// Physical keyboard state straight from the HID system. Key releases that
+// happen while the viewer is unfocused never reach the local monitor, so the
+// client uses this to decide which blocked modifiers to press again.
+bool remote_physical_key_down(unsigned short keyCode) {
+    return CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, keyCode);
 }
 
 void remote_preview_destroy(void *handle) {

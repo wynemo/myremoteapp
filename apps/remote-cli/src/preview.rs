@@ -342,9 +342,12 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             }
                         }
                         let active = viewer_active(&window);
-                        for event in
-                            keyboard.update(keyboard_queue.drain()?, active, frame.sequence)
-                        {
+                        for event in keyboard.update(
+                            keyboard_queue.drain()?,
+                            active,
+                            frame.sequence,
+                            crate::keyboard::key_still_down,
+                        ) {
                             input.send(event)?;
                         }
                         #[cfg(target_os = "macos")]
