@@ -7,7 +7,7 @@
 先停止 Windows 上的旧程序，在管理员 PowerShell 下载已通过真实密码解锁验证的版本：
 
 ```powershell
-python download_windows.py --run-id 41155922262 --force
+python download_windows.py --run-id 41157923196 --force
 .\remote-cli.exe serve --desktop --experimental-lock-screen
 ```
 
@@ -17,15 +17,16 @@ python download_windows.py --run-id 41155922262 --force
 
 ## 已完成的验证
 
-[Windows CI run 41155922262](https://github.com/wynemo/myremoteapp/actions/runs/41155922262/job/124402571666) 在提交 `ca7f127` 上原生完成 Release / `--locked` 构建、测试和 Clippy；随后完成真实密码解锁：
+[Windows CI run 41157923196](https://github.com/wynemo/myremoteapp/actions/runs/41157923196/job/124408750699) 在提交 `757660b` 上原生完成 Release / `--locked` 构建、测试和 Clippy；随后完成真实密码解锁：
 
 1. 管理员进程创建 SYSTEM 替代进程，原进程退出，CI 明确检查原进程退出码。
 2. 先通过一个预览协议会话订阅真实 Windows 采集流，再锁定当前会话，从 Default 切换到 Winlogon。
-3. 在密码控件取得焦点后，通过与远控相同的输入控制器输入一次临时随机密码并提交。
-4. 检查当前输入桌面实际返回 Default；报告 `actual_unlock_verified=true`，替代进程 PID 为 5548。
-5. 解锁后原预览会话继续收到至少三帧更新序号的桌面画面；报告 `preview_continuity_verified=true`，全程未重连。
+3. 锁屏状态下再创建独立采集源和预览会话，确认新连接收到首帧；验证 `locked_connect_verified=true`。
+4. 在密码控件取得焦点后，通过与远控相同的输入控制器输入一次临时随机密码并提交。
+5. 检查当前输入桌面实际返回 Default；报告 `actual_unlock_verified=true`，替代进程 PID 为 7748。
+6. 解锁后两个原预览会话均继续收到至少三帧更新序号的桌面画面；报告 `preview_continuity_verified=true`，全程未重连。
 
-这不是只检查 SendInput 返回值。临时密码只用于一次性 GitHub-hosted runner，通过一次性双向命名管道传递，不放入命令参数、环境变量或日志。测试不使用用户机器的密码。
+还在 Default 和 Winlogon 上强制执行原尺寸 BitBlt 加 CPU 缩小，并检查 JPEG 解码尺寸；报告 `native_copy_resize_verified=true`。这不是只检查 SendInput 返回值。临时密码只用于一次性 GitHub-hosted runner，通过一次性双向命名管道传递，不放入命令参数、环境变量或日志。测试不使用用户机器的密码。
 
 CI 测试脚本为一次性 runner 配置标准密码登录、可见测试账号并关闭强制自动登录与 Ctrl+Alt+Del 要求，使测试进入密码界面；这些操作只存在于 `scripts/test_windows_unlock.ps1`，普通程序启动不执行。CI 可采集输入密码前的界面及控件元数据，保留一天，不采集密码输入后的画面。UI Automation 仅用于测试准备用户名和密码框焦点，密码本身仍由实际输入控制器发送。
 
@@ -35,6 +36,7 @@ macOS 本机另已通过 macOS 与共享模块的 Release 测试、Clippy；未�
 
 - 在管理员启动线程临时模拟当前会话 SYSTEM 身份，校验令牌 SID，复制 SYSTEM 主令牌。启用私有线程令牌上的进程创建权限，使用 CreateProcessAsUserW 创建相同 EXE；新进程保留原参数和工作目录，使用 `winsta0\default` 及独立控制台。原进程立即返回，不维持辅助进程或父进程等待循环。SYSTEM 进程检查自身 SID，避免重复自重启。
 - SYSTEM 锁屏模式下，桌面切换导致的短暂采集失败最多等待 5 秒：立即清除服务端旧画面和旧帧坐标、暂停输入，但不发送预览结束标记；新画面就绪后继续原连接。持续失败超过 5 秒仍按错误结束，避免无限等待。该期限短于客户端 10 秒画面超时。普通模式保持原来的停止行为。
+- 不需要缩放时直接 BitBlt，避免仍调用 StretchBlt。需要缩小时先走硬件 StretchBlt，失败后用原尺寸 BitBlt 读取，再用 CPU 双线性缩小至既定帧尺寸。原尺寸后备 DIB 上限为 256 MiB，防止超大虚拟桌面耗尽内存。原尺寸输出不额外复制像素。BitBlt 若仍失败，日志包含 Win32 错误码、桌面名称、源范围、输出尺寸及 RASTERCAPS；具体显卡兼容性仍须目标设备复测。
 - 采集与输入分别使用专用 OS 线程。输入线程持续绑定当前输入桌面，仅在桌面切换时重新绑定。清除上个桌面的帧坐标，拒绝旧画面事件；断开、失败和退出时尝试释放按键。
 - 普通按键按前台键盘布局映射为物理扫描码，保留扩展键与松开标志；Pause 等特殊键使用虚拟键回退。客户端不提供 Unicode/IME 文本提交或剪贴板密码填入。
 
