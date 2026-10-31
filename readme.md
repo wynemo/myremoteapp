@@ -38,6 +38,8 @@ cargo run --locked --release -- serve --virtual-display
 
 默认模式遇到锁屏或 UAC 安全桌面会暂停。暂不支持 Windows 单窗口选择、Ctrl+Alt+Del 登录策略、BitLocker 或重启后自动运行；PIN 和多屏行为尚待实机验收。
 
+当前不支持“无显示器、从 RDP 启动后再断开 RDP”的独立运行：程序仍绑定原 RDP 会话，显示面失效时无法采集。Windows 持久虚拟显示及跨会话处理尚未实现。
+
 ## 客户端：打开画面
 
 Mac 在项目目录连接（将服务端的 `connect.json` 放在当前目录，替换为服务端 IP）：
