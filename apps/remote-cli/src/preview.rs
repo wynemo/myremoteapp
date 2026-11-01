@@ -266,16 +266,30 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             .as_ref()
             .and_then(|input| input.clipboard_token.clone()),
     ) {
-        let mut stream = connect.await?;
-        let permissions =
-            remote_session::clipboard::start(&mut stream, token, clipboard_permissions).await?;
-        let running = crate::clipboard::Running::start(stream, permissions);
-        if permissions.send
-            && let Some(input) = &input
-        {
-            input.set_clipboard_barrier(running.backend.clone(), running.progress.clone());
+        let connected: Result<_> = async {
+            let mut stream = connect.await?;
+            let permissions =
+                remote_session::clipboard::start(&mut stream, token, clipboard_permissions).await?;
+            Ok((
+                crate::clipboard::Running::start(stream, permissions),
+                permissions,
+            ))
         }
-        Some(running)
+        .await;
+        match connected {
+            Ok((running, permissions)) => {
+                if permissions.send
+                    && let Some(input) = &input
+                {
+                    input.set_clipboard_barrier(running.backend.clone(), running.progress.clone());
+                }
+                Some(running)
+            }
+            Err(error) => {
+                eprintln!("剪贴板连接失败，画面和键鼠仍可使用：{error:#}");
+                None
+            }
+        }
     } else {
         None
     };
