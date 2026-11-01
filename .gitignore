@@ -2,6 +2,9 @@
 /.local/
 /dist/
 __pycache__/
+.DS_Store
+/win/
+/137/
 connect.json
 identity.json
 /remote-cli.exe
