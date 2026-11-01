@@ -9,3 +9,4 @@ anyhow.workspace = true
 remote-protocol = { path = "../protocol" }
 tokio.workspace = true
 zeroize.workspace = true
+getrandom = "0.4"

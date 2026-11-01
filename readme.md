@@ -66,7 +66,9 @@ Windows：
 
 连接后自动打开可用键鼠操作的窗口；`Esc` 发送到远端，关闭窗口退出。代理需要认证时，设置 `REMOTEAPP_SOCKS5_USER` 和 `REMOTEAPP_SOCKS5_PASSWORD`。
 
-Mac 的 Command 对应 Windows 键，Control 对应 Ctrl，Option 对应 Alt。键盘使用服务端布局与输入法；暂不转发本地输入法提交的中文文本或剪贴板，部分系统快捷键仍由本机处理。
+默认双向共享文字和图片剪贴板：连接后重新复制，再在另一端粘贴。支持中文、表情、截图和单张图片；不支持文件、文件夹或富文本格式。两端都需更新，连接文件无需更换。只观看时关闭剪贴板；可在 `serve` 或 `connect` 后加 `--clipboard off` 关闭，或用 `send` / `receive` 限制为本端只发送 / 只接收。锁屏时暂停，不补发锁屏期间的内容。Mac 单窗口共享使用系统剪贴板，也会共享其他应用复制的内容。
+
+Mac 的 Command 对应 Windows 键，Control 对应 Ctrl，Option 对应 Alt。复制和粘贴使用远端系统的快捷键（Windows 用 Ctrl+C / Ctrl+V，Mac 用 Command+C / Command+V）。键盘使用服务端布局与输入法；暂不转发本地输入法提交的中文文本，可通过剪贴板粘贴中文，部分系统快捷键仍由本机处理。
 
 键鼠操作会影响服务端本地输入；Mac 上还会激活目标窗口。只观看时可在连接命令后加 `--view-only`。
 

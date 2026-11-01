@@ -15,6 +15,7 @@ pub const SERVER_NAME: &str = "remoteapp.local";
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A required proxy route. Failure never falls back to a direct connection.
+#[derive(Clone)]
 pub struct Socks5Proxy {
     pub address: String,
     pub credentials: Option<(String, String)>,

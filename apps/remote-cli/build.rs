@@ -12,9 +12,11 @@ fn main() {
     }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rerun-if-changed=native/preview_macos.m");
+        println!("cargo:rerun-if-changed=native/clipboard_macos.m");
         println!("cargo:rerun-if-changed=native/workspace_macos.m");
         cc::Build::new()
             .file("native/preview_macos.m")
+            .file("native/clipboard_macos.m")
             .file("native/workspace_macos.m")
             .flag("-fobjc-arc")
             .compile("remote_preview_macos");

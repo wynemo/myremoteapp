@@ -76,6 +76,11 @@ jobs:
       - name: Test
         run: cargo test --locked --release --workspace --target ${{ matrix.target }}
 
+      - name: Test native clipboard on disposable runner
+        env:
+          REMOTEAPP_CLIPBOARD_NATIVE_TEST: '1'
+        run: cargo test --locked --release -p remote-cli --target ${{ matrix.target }} native_clipboard_roundtrip_on_disposable_runner -- --ignored --exact clipboard::tests::native_clipboard_roundtrip_on_disposable_runner --test-threads=1
+
       - name: Test native macOS preview coordinates
         if: runner.os == 'macOS'
         run: bash scripts/test_preview_geometry.sh

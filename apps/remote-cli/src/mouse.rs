@@ -199,6 +199,99 @@ mod connection {
             assert_eq!(coalesce_motion(next, &mut rx, &mut pending), movement(3));
             assert_eq!(pending.take(), Some(Message::ReleaseInput));
         }
+
+        struct ClipboardFixture;
+        impl remote_session::clipboard::Backend for ClipboardFixture {
+            fn available(&self) -> bool {
+                true
+            }
+            fn version(&self) -> u64 {
+                2
+            }
+            fn read(&self) -> Result<Option<remote_session::clipboard::Content>> {
+                Ok(None)
+            }
+            fn write(&self, _: u64, _: &remote_session::clipboard::Content) -> Result<Option<u64>> {
+                Ok(None)
+            }
+        }
+        #[tokio::test]
+        async fn paste_waits_for_sync_but_plain_v_does_not() {
+            use remote_protocol::{KeyCode, KeyEvent};
+            use std::sync::{Arc, atomic::Ordering};
+            let (client, mut server) = tokio::io::duplex(2048);
+            let (tx, mut rx) = mpsc::channel(16);
+            let fixture = tokio::spawn(async move {
+                assert!(matches!(
+                    read_message(&mut server).await.unwrap(),
+                    Message::Hello { .. }
+                ));
+                write_message(
+                    &mut server,
+                    &Message::Welcome {
+                        version: remote_protocol::VERSION,
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    read_message(&mut server).await.unwrap(),
+                    Message::StartControl { .. }
+                ));
+                write_message(
+                    &mut server,
+                    &Message::ControlReady {
+                        clipboard_token: None,
+                    },
+                )
+                .await
+                .unwrap();
+                while let Ok(message) = read_message(&mut server).await {
+                    match message {
+                        Message::Ping { sequence } => {
+                            write_message(&mut server, &Message::Pong { sequence })
+                                .await
+                                .unwrap()
+                        }
+                        Message::Key { event } => {
+                            tx.send(event.key).await.unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            let input = ControlClient::start(client, 1).await.unwrap();
+            let progress = Arc::new(remote_session::clipboard::Progress::default());
+            progress.healthy.store(true, Ordering::Release);
+            progress.settled_version.store(1, Ordering::Release);
+            input.set_clipboard_barrier(Arc::new(ClipboardFixture), progress.clone());
+            let key = |key| Message::Key {
+                event: KeyEvent {
+                    frame_sequence: 1,
+                    key,
+                    down: true,
+                },
+            };
+            input.send(key(KeyCode::V)).unwrap();
+            assert_eq!(
+                timeout(Duration::from_secs(1), rx.recv()).await.unwrap(),
+                Some(KeyCode::V)
+            );
+            input.send(key(KeyCode::LeftCtrl)).unwrap();
+            input.send(key(KeyCode::V)).unwrap();
+            assert_eq!(
+                timeout(Duration::from_secs(1), rx.recv()).await.unwrap(),
+                Some(KeyCode::LeftCtrl)
+            );
+            assert!(timeout(Duration::from_millis(60), rx.recv()).await.is_err());
+            progress.settled_version.store(2, Ordering::Release);
+            assert_eq!(
+                timeout(Duration::from_secs(1), rx.recv()).await.unwrap(),
+                Some(KeyCode::V)
+            );
+            drop(input);
+            fixture.abort();
+        }
     }
 
     #[derive(Clone, PartialEq)]
@@ -207,7 +300,13 @@ mod connection {
         Notice(String),
         Failed(String),
     }
+    type ClipboardBarrier = Option<(
+        std::sync::Arc<dyn remote_session::clipboard::Backend>,
+        std::sync::Arc<remote_session::clipboard::Progress>,
+    )>;
     pub struct ControlClient {
+        clipboard_barrier: std::sync::Arc<std::sync::Mutex<ClipboardBarrier>>,
+        pub clipboard_token: Option<String>,
         sender: mpsc::Sender<Message>,
         status: watch::Receiver<Status>,
         writer: Option<JoinHandle<()>>,
@@ -218,22 +317,57 @@ mod connection {
             mut stream: S,
             window: u32,
         ) -> Result<Self> {
-            remote_session::start_control(&mut stream, window).await?;
+            let clipboard_token =
+                remote_session::start_control_with_clipboard(&mut stream, window).await?;
             let (mut read, mut write) = tokio::io::split(stream);
             let (sender, mut input) = mpsc::channel(64);
             let (status_tx, status) = watch::channel(Status::Ready);
             let failure = status_tx.clone();
+            let clipboard_barrier = std::sync::Arc::new(std::sync::Mutex::new(
+                None::<(
+                    std::sync::Arc<dyn remote_session::clipboard::Backend>,
+                    std::sync::Arc<remote_session::clipboard::Progress>,
+                )>,
+            ));
+            let barrier = clipboard_barrier.clone();
             let writer = tokio::spawn(async move {
                 let result: Result<()> = async {
                     let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
                     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     let mut pending = None;
+                    let mut held=std::collections::BTreeSet::new();
                     loop {
                         let message = if let Some(message) = pending.take() { message } else { tokio::select! {
                             message=input.recv()=>match message {Some(message)=>message,None=>break},
                             _=heartbeat.tick()=>Message::Ping { sequence:0 },
                         }};
                         let message = coalesce_motion(message, &mut input, &mut pending);
+                        use remote_protocol::KeyCode;
+                        match &message {
+                            Message::Key {event} => {if event.down {held.insert(event.key);} else {held.remove(&event.key);}},
+                            Message::ReleaseInput | Message::ReleaseKeyboard => held.clear(),
+                            _ => {},
+                        }
+                        let paste_modifier=[KeyCode::LeftCtrl,KeyCode::RightCtrl,KeyCode::LeftSuper,KeyCode::RightSuper].iter().any(|key|held.contains(key));
+                        if paste_modifier && matches!(&message, Message::Key {event:remote_protocol::KeyEvent {key:KeyCode::V,down:true,..}}) {
+                            let current=barrier.lock().unwrap().clone();
+                            if let Some((backend,progress))=current {
+                                let ready=timeout(remote_session::IO_TIMEOUT,async {
+                                    loop {
+                                        if progress.healthy.load(std::sync::atomic::Ordering::Acquire) && backend.available() && backend.version()==progress.settled_version.load(std::sync::atomic::Ordering::Acquire) {break Ok::<_,anyhow::Error>(());}
+                                        tokio::select! {
+                                            _=tokio::time::sleep(Duration::from_millis(10))=>{},
+                                            _=heartbeat.tick()=>{timeout(remote_session::IO_TIMEOUT,write_message(&mut write,&Message::Ping {sequence:0})).await??;},
+                                        }
+                                    }
+                                }).await;
+                                if let Ok(Err(error))=ready {return Err(error);}
+                                if ready.is_err() {
+                                    failure.send_replace(Status::Notice("剪贴板未同步，已取消此次粘贴；请重新复制后重试".into()));
+                                    continue;
+                                }
+                            }
+                        }
                         timeout(remote_session::IO_TIMEOUT,write_message(&mut write,&message)).await??;
                         if message==Message::Goodbye { write.shutdown().await?; break; }
                     }
@@ -262,11 +396,20 @@ mod connection {
                 }
             });
             Ok(Self {
+                clipboard_token,
+                clipboard_barrier,
                 sender,
                 status,
                 writer: Some(writer),
                 reader,
             })
+        }
+        pub fn set_clipboard_barrier(
+            &self,
+            backend: std::sync::Arc<dyn remote_session::clipboard::Backend>,
+            progress: std::sync::Arc<remote_session::clipboard::Progress>,
+        ) {
+            *self.clipboard_barrier.lock().unwrap() = Some((backend, progress));
         }
         pub fn status(&self) -> Status {
             self.status.borrow().clone()

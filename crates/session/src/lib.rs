@@ -1,4 +1,5 @@
-//! Authenticated diagnostic, video, and mouse-control sessions.
+//! Authenticated diagnostic, video, input, and clipboard sessions.
+pub mod clipboard;
 use anyhow::{Result, bail};
 use remote_protocol::{
     ErrorCode, KeyEvent, Message, MouseEvent, PreviewFrame, UnlockOutcome, VERSION, WindowInfo,
@@ -77,21 +78,30 @@ pub trait UnlockHost: Send + Sync {
     fn capture_ready(&self) -> bool;
 }
 
-pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> Result<()> {
+pub async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send>(stream: &mut S) -> Result<()> {
     serve_with_preview(stream, None).await
 }
 
-pub async fn serve_with_preview<S: AsyncRead + AsyncWrite + Unpin>(
+pub async fn serve_with_preview<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream: &mut S,
     preview: Option<PreviewSource>,
 ) -> Result<()> {
     serve_with_host(stream, preview, None).await
 }
 
-pub async fn serve_with_host<S: AsyncRead + AsyncWrite + Unpin>(
+pub async fn serve_with_host<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream: &mut S,
     preview: Option<PreviewSource>,
     unlock: Option<Arc<dyn UnlockHost>>,
+) -> Result<()> {
+    serve_with_clipboard(stream, preview, unlock, None).await
+}
+
+pub async fn serve_with_clipboard<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    stream: &mut S,
+    preview: Option<PreviewSource>,
+    unlock: Option<Arc<dyn UnlockHost>>,
+    clipboard: Option<Arc<clipboard::Host>>,
 ) -> Result<()> {
     let hello = timeout(IO_TIMEOUT, read_message(stream)).await??;
     match hello {
@@ -183,6 +193,33 @@ pub async fn serve_with_host<S: AsyncRead + AsyncWrite + Unpin>(
                 };
                 return stream_preview(stream, source).await;
             }
+            Message::StartClipboard {
+                token,
+                send: client_send,
+                receive: client_receive,
+            } => {
+                let host = clipboard
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("clipboard disabled"))?;
+                let mut active = host.attach(&token)?;
+                let permissions = clipboard::Permissions {
+                    send: host.permissions.send && client_receive,
+                    receive: host.permissions.receive && client_send,
+                };
+                send(
+                    stream,
+                    &Message::ClipboardReady {
+                        send: permissions.receive,
+                        receive: permissions.send,
+                    },
+                )
+                .await?;
+                let backend = clipboard::leased_backend(host.backend.clone(), active.clone());
+                return tokio::select! {
+                    result=clipboard::exchange(stream,backend,permissions,true)=>result,
+                    _=active.changed()=>Ok(()),
+                };
+            }
             Message::StartControl { window_id } => {
                 let Some(source) = preview.filter(|source| source.window.id == window_id) else {
                     send(
@@ -217,7 +254,14 @@ pub async fn serve_with_host<S: AsyncRead + AsyncWrite + Unpin>(
                         return Err(error);
                     }
                 };
-                send(stream, &Message::ControlReady).await?;
+                let clipboard_lease = clipboard.as_ref().map(|host| host.lease()).transpose()?;
+                send(
+                    stream,
+                    &Message::ControlReady {
+                        clipboard_token: clipboard_lease.as_ref().map(|lease| lease.token.clone()),
+                    },
+                )
+                .await?;
                 loop {
                     match timeout(IO_TIMEOUT, read_message(stream)).await?? {
                         Message::Mouse { event } => {
@@ -323,6 +367,15 @@ pub async fn start_control<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     window_id: u32,
 ) -> Result<()> {
+    start_control_with_clipboard(stream, window_id)
+        .await
+        .map(|_| ())
+}
+
+pub async fn start_control_with_clipboard<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    window_id: u32,
+) -> Result<Option<String>> {
     send(stream, &Message::Hello { version: VERSION }).await?;
     if timeout(IO_TIMEOUT, read_message(stream)).await?? != (Message::Welcome { version: VERSION })
     {
@@ -330,7 +383,7 @@ pub async fn start_control<S: AsyncRead + AsyncWrite + Unpin>(
     }
     send(stream, &Message::StartControl { window_id }).await?;
     match timeout(IO_TIMEOUT, read_message(stream)).await?? {
-        Message::ControlReady => Ok(()),
+        Message::ControlReady { clipboard_token } => Ok(clipboard_token),
         Message::Error {
             code: ErrorCode::ControlBusy,
         } => bail!("已有客户端正在控制该共享画面；可加 --view-only 仅观看"),
@@ -1018,5 +1071,84 @@ mod tests {
             .await
             .unwrap();
         assert!(host.cancelled.load(std::sync::atomic::Ordering::Acquire));
+    }
+    struct ClipboardFixture;
+    impl clipboard::Backend for ClipboardFixture {
+        fn available(&self) -> bool {
+            true
+        }
+        fn version(&self) -> u64 {
+            1
+        }
+        fn read(&self) -> Result<Option<clipboard::Content>> {
+            Ok(None)
+        }
+        fn write(&self, _: u64, _: &clipboard::Content) -> Result<Option<u64>> {
+            Ok(None)
+        }
+    }
+    #[tokio::test]
+    async fn clipboard_socket_negotiates_directions_and_ends_with_input_lease() {
+        let clipboard = clipboard::Host::new(
+            Arc::new(ClipboardFixture),
+            clipboard::Permissions {
+                send: true,
+                receive: false,
+            },
+        );
+        let (_sender, frames) = watch::channel(None);
+        let source = PreviewSource {
+            window: WindowInfo {
+                id: 5,
+                app: "fixture".into(),
+                title: "fixture".into(),
+                width: 4,
+                height: 4,
+            },
+            frames,
+            demand: PreviewDemand::default(),
+            input: Some(Arc::new(TestController(Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            )))),
+        };
+        let (mut control, mut control_socket) = tokio::io::duplex(2048);
+        let control_clipboard = clipboard.clone();
+        let control_task = tokio::spawn(async move {
+            serve_with_clipboard(
+                &mut control_socket,
+                Some(source),
+                None,
+                Some(control_clipboard),
+            )
+            .await
+        });
+        let token = start_control_with_clipboard(&mut control, 5)
+            .await
+            .unwrap()
+            .unwrap();
+        let (mut client, mut socket) = tokio::io::duplex(2048);
+        let task = tokio::spawn(async move {
+            serve_with_clipboard(&mut socket, None, None, Some(clipboard)).await
+        });
+        let actual = clipboard::start(
+            &mut client,
+            token,
+            clipboard::Permissions {
+                send: true,
+                receive: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!actual.send && actual.receive);
+        drop(control);
+        assert!(control_task.await.unwrap().is_err());
+        assert!(
+            timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_ok()
+        );
     }
 }

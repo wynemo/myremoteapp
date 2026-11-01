@@ -7,6 +7,9 @@ use tokio::{
     time::timeout,
 };
 
+pub type ClipboardConnection<S> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<S>> + Send>>;
+
 #[derive(Debug)]
 pub struct DecodedFrame {
     pub width: usize,
@@ -239,6 +242,8 @@ fn viewer_active(window: &minifb::Window) -> bool {
 pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut stream: S,
     control: Option<S>,
+    clipboard_stream: Option<ClipboardConnection<S>>,
+    clipboard_permissions: remote_session::clipboard::Permissions,
 ) -> Result<()> {
     use crate::keyboard::{KeyboardQueue, KeyboardTracker};
     use crate::mouse::{ControlClient, MouseSample, MouseTracker, Status};
@@ -252,6 +257,25 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let first = Arc::new(decode(&first_raw)?);
     let input = if let Some(control) = control {
         Some(ControlClient::start(control, shared.id).await?)
+    } else {
+        None
+    };
+    let _clipboard = if let (Some(connect), Some(token)) = (
+        clipboard_stream,
+        input
+            .as_ref()
+            .and_then(|input| input.clipboard_token.clone()),
+    ) {
+        let mut stream = connect.await?;
+        let permissions =
+            remote_session::clipboard::start(&mut stream, token, clipboard_permissions).await?;
+        let running = crate::clipboard::Running::start(stream, permissions);
+        if permissions.send
+            && let Some(input) = &input
+        {
+            input.set_clipboard_barrier(running.backend.clone(), running.progress.clone());
+        }
+        Some(running)
     } else {
         None
     };
@@ -392,6 +416,8 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     _stream: S,
     _control: Option<S>,
+    _clipboard_stream: Option<ClipboardConnection<S>>,
+    _clipboard_permissions: remote_session::clipboard::Permissions,
 ) -> Result<()> {
     bail!("图形预览支持 macOS 和 Windows；当前平台可用 --save-frame preview.jpg 或 --check-only")
 }

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, ErrorKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const VERSION: u16 = 5;
+pub const VERSION: u16 = 6;
 pub const MAX_PASSWORD_BYTES: usize = 4096;
 pub const MAX_CONTROL_BYTES: usize = 64 * 1024;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -218,7 +218,41 @@ pub enum Message {
     StartControl {
         window_id: u32,
     },
-    ControlReady,
+    ControlReady {
+        #[serde(default)]
+        clipboard_token: Option<String>,
+    },
+    StartClipboard {
+        token: String,
+        send: bool,
+        receive: bool,
+    },
+    ClipboardReady {
+        send: bool,
+        receive: bool,
+    },
+    ClipboardOffer {
+        revision: u64,
+        generation: u64,
+        format: ClipboardFormat,
+        length: u32,
+    },
+    ClipboardRequest {
+        revision: u64,
+    },
+    /// A bounded binary record follows, never JSON/base64.
+    ClipboardData {
+        revision: u64,
+    },
+    ClipboardApplied {
+        revision: u64,
+        generation: u64,
+    },
+    ClipboardRejected {
+        revision: u64,
+        generation: u64,
+    },
+    ClipboardPaused,
     Mouse {
         event: MouseEvent,
     },
@@ -241,6 +275,13 @@ pub enum Message {
     UnlockResult {
         outcome: UnlockOutcome,
     },
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardFormat {
+    Text,
+    Png,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]

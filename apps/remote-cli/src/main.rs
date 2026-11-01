@@ -2,6 +2,8 @@
 mod bgra_resize;
 #[cfg(any(target_os = "macos", test))]
 mod capture_readiness;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+mod clipboard;
 #[cfg(any(target_os = "windows", test))]
 mod desktop_geometry;
 #[cfg(any(target_os = "windows", test))]
@@ -45,6 +47,23 @@ use tokio::{net::TcpListener, sync::Semaphore};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum, Default)]
+enum ClipboardMode {
+    Off,
+    #[default]
+    Both,
+    Send,
+    Receive,
+}
+impl ClipboardMode {
+    fn permissions(self) -> remote_session::clipboard::Permissions {
+        remote_session::clipboard::Permissions {
+            send: matches!(self, Self::Both | Self::Send),
+            receive: matches!(self, Self::Both | Self::Receive),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -101,6 +120,9 @@ enum Command {
         /// 仅共享画面，不启用键鼠控制；虚拟屏模式仍需辅助功能权限来移动窗口。
         #[arg(long, conflicts_with = "check_only")]
         view_only: bool,
+        /// 剪贴板：off / both / send（本端发送）/ receive（本端接收）。只观看时关闭。
+        #[arg(long, value_enum, default_value = "both")]
+        clipboard: ClipboardMode,
         /// 实验：单进程线程模拟访问 Windows 锁屏；需要管理员，尚未完成真实解锁验收。
         #[cfg(target_os = "windows")]
         #[arg(long, conflicts_with = "check_only")]
@@ -130,6 +152,9 @@ enum Command {
         /// 只观看画面，不建立键鼠控制连接。
         #[arg(long, conflicts_with_all = ["save_frame", "check_only"])]
         view_only: bool,
+        /// 剪贴板：off / both / send（本端发送）/ receive（本端接收）。只观看时关闭。
+        #[arg(long, value_enum, default_value = "both")]
+        clipboard: ClipboardMode,
     },
 }
 
@@ -171,6 +196,7 @@ async fn main() -> Result<()> {
             check_only,
             save_frame,
             view_only,
+            clipboard,
         } => {
             let connection = pairing::ConnectionFile::load(&connection_file)
                 .with_context(|| format!("无法读取连接文件 {}", connection_file.display()))?;
@@ -223,12 +249,27 @@ async fn main() -> Result<()> {
                     preview::save_frame(&mut stream, &path).await?;
                     return Ok(());
                 }
+                let clipboard_stream = if !view_only && clipboard.permissions().enabled() {
+                    let clipboard_address = address.clone();
+                    let clipboard_config = config.clone();
+                    let clipboard_proxy = proxy.clone();
+                    Some(Box::pin(async move {
+                        remote_transport::connect_via(
+                            &clipboard_address,
+                            clipboard_config,
+                            clipboard_proxy.as_ref(),
+                        )
+                        .await
+                    }) as preview::ClipboardConnection<_>)
+                } else {
+                    None
+                };
                 let control = if view_only {
                     None
                 } else {
                     Some(remote_transport::connect_via(&address, config, proxy.as_ref()).await?)
                 };
-                preview::view(stream, control).await?;
+                preview::view(stream, control, clipboard_stream, clipboard.permissions()).await?;
             }
         }
         Command::Serve {
@@ -240,6 +281,7 @@ async fn main() -> Result<()> {
             desktop,
             check_only,
             view_only,
+            clipboard,
             #[cfg(target_os = "windows")]
             experimental_lock_screen,
         } => {
@@ -302,6 +344,20 @@ async fn main() -> Result<()> {
                 )));
             #[cfg(not(target_os = "macos"))]
             let unlock: Option<Arc<dyn remote_session::UnlockHost>> = None;
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            let clipboard_host = if !view_only && !check_only && clipboard.permissions().enabled() {
+                Some(remote_session::clipboard::Host::new(
+                    Arc::new(crate::clipboard::Native),
+                    clipboard.permissions(),
+                ))
+            } else {
+                None
+            };
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            let clipboard_host = {
+                let _ = clipboard;
+                None
+            };
             let state = pairing::load_or_create(&state_dir, reset_pairing)?;
             let config = remote_transport::server_config(
                 Identity::from_pem(
@@ -382,11 +438,18 @@ async fn main() -> Result<()> {
                 let config = config.clone();
                 let preview = preview.clone();
                 let unlock = unlock.clone();
+                let clipboard_host = clipboard_host.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     let result = async {
                         let mut stream = remote_transport::accept(tcp, config).await?;
-                        remote_session::serve_with_host(&mut stream, preview, unlock).await
+                        remote_session::serve_with_clipboard(
+                            &mut stream,
+                            preview,
+                            unlock,
+                            clipboard_host,
+                        )
+                        .await
                     }
                     .await;
                     match result {
