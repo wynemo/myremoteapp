@@ -47,6 +47,20 @@ pub trait Backend: Send + Sync {
     fn version(&self) -> u64;
     fn read(&self) -> Result<Option<Content>>;
     fn write(&self, expected: u64, content: &Content) -> Result<Option<u64>>;
+    /// Native backends recheck this after expensive decoding, immediately before
+    /// changing the system clipboard, so cancelled work cannot commit later.
+    fn write_guarded(
+        &self,
+        expected: u64,
+        content: &Content,
+        allowed: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Option<u64>> {
+        if allowed() {
+            self.write(expected, content)
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -452,7 +466,8 @@ impl Backend for LeasedBackend {
         if !self.available() {
             return Ok(None);
         }
-        self.inner.write(expected, content)
+        self.inner
+            .write_guarded(expected, content, &|| self.available())
     }
 }
 pub(crate) fn leased_backend(
@@ -725,5 +740,58 @@ mod tests {
                 .unwrap()
                 .is_err()
         );
+    }
+    struct DeferredWrite {
+        entered: AtomicBool,
+        resume: AtomicBool,
+        committed: AtomicBool,
+    }
+    impl Backend for DeferredWrite {
+        fn available(&self) -> bool {
+            true
+        }
+        fn version(&self) -> u64 {
+            1
+        }
+        fn read(&self) -> Result<Option<Content>> {
+            Ok(None)
+        }
+        fn write(&self, _: u64, _: &Content) -> Result<Option<u64>> {
+            panic!("must use final authorization guard")
+        }
+        fn write_guarded(
+            &self,
+            _: u64,
+            _: &Content,
+            allowed: &(dyn Fn() -> bool + Sync),
+        ) -> Result<Option<u64>> {
+            self.entered.store(true, Ordering::Release);
+            while !self.resume.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if !allowed() {
+                return Ok(None);
+            }
+            self.committed.store(true, Ordering::Release);
+            Ok(Some(2))
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_control_cannot_commit_a_delayed_native_write() {
+        let native = Arc::new(DeferredWrite {
+            entered: AtomicBool::new(false),
+            resume: AtomicBool::new(false),
+            committed: AtomicBool::new(false),
+        });
+        let host = Host::new(native.clone(), BOTH);
+        let lease = host.lease().unwrap();
+        let active = host.attach(&lease.token).unwrap();
+        let backend = leased_backend(native.clone(), active);
+        let work = tokio::task::spawn_blocking(move || backend.write(1, &text_content("delayed")));
+        until(|| native.entered.load(Ordering::Acquire)).await;
+        drop(lease);
+        native.resume.store(true, Ordering::Release);
+        assert!(work.await.unwrap().unwrap().is_none());
+        assert!(!native.committed.load(Ordering::Acquire));
     }
 }

@@ -70,6 +70,14 @@ impl Backend for Native {
         Ok(None)
     }
     fn write(&self, expected: u64, content: &Content) -> Result<Option<u64>> {
+        self.write_guarded(expected, content, &|| true)
+    }
+    fn write_guarded(
+        &self,
+        expected: u64,
+        content: &Content,
+        allowed: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Option<u64>> {
         content.validate()?;
         // Decode before the final version check, as a large image can take time.
         let image = if content.format == ClipboardFormat::Png {
@@ -78,7 +86,7 @@ impl Backend for Native {
             None
         };
         let mut clipboard = Clipboard::new()?;
-        if !self.available() || self.version() != expected {
+        if !allowed() || !self.available() || self.version() != expected {
             return Ok(None);
         }
         if let Some(image) = image {
@@ -181,7 +189,7 @@ impl Backend for ActiveBackend {
     }
     fn write(&self, expected: u64, content: &Content) -> Result<Option<u64>> {
         if self.available() {
-            Native.write(expected, content)
+            Native.write_guarded(expected, content, &|| self.available())
         } else {
             Ok(None)
         }
@@ -284,6 +292,13 @@ mod tests {
             },
         ] {
             let version = backend.version();
+            assert!(
+                backend
+                    .write_guarded(version, &content, &|| false)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(backend.version(), version);
             assert!(backend.write(version, &content).unwrap().is_some());
             let read = backend.read().unwrap().unwrap();
             assert_eq!(read.format, content.format);
