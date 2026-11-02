@@ -171,6 +171,12 @@ mod macos_image {
         ) -> bool;
         fn remote_preview_keyboard_enabled(view: *mut c_void, enabled: bool);
         fn remote_preview_pixel_size(view: *mut c_void, width: *mut usize, height: *mut usize);
+        fn remote_preview_display_metrics(
+            view: *mut c_void,
+            width: *mut usize,
+            height: *mut usize,
+            scale: *mut u32,
+        );
         fn remote_preview_destroy(view: *mut c_void);
     }
     pub struct Renderer {
@@ -207,6 +213,13 @@ mod macos_image {
                 remote_preview_pixel_size(self.view, &mut width, &mut height);
             }
             (width, height)
+        }
+        pub fn display_metrics(&self) -> ((usize, usize), u32) {
+            let (mut width, mut height, mut scale) = (0, 0, 100);
+            unsafe {
+                remote_preview_display_metrics(self.view, &mut width, &mut height, &mut scale);
+            }
+            ((width, height), scale)
         }
         pub fn present(&mut self, window: &mut minifb::Window, frame: &DecodedFrame) -> Result<()> {
             let key = (frame.sequence, frame.width, frame.height);
@@ -272,6 +285,7 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     clipboard_stream: Option<ClipboardConnection<S>>,
     clipboard_permissions: remote_session::clipboard::Permissions,
     optimize_retina: bool,
+    resize_session: bool,
 ) -> Result<()> {
     use crate::keyboard::{KeyboardQueue, KeyboardTracker};
     use crate::mouse::{ControlClient, MouseSample, MouseTracker, Status};
@@ -373,6 +387,7 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let mut notice = None;
     let mut displayed_dimensions = None;
     let mut resize = crate::display_resize::ResizeTracker::default();
+    let mut last_scale = None;
     let result = (|| -> Result<()> {
         while window.is_open() {
             let current = receiver.borrow().clone();
@@ -390,19 +405,56 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     window.update_with_buffer(&frame.pixels, frame.width, frame.height)?;
                     if let Some(input) = &input {
                         #[cfg(target_os = "macos")]
-                        let size = renderer.desktop_size(optimize_retina);
+                        let (screen, scale) = renderer.display_metrics();
                         #[cfg(target_os = "windows")]
-                        let size = if optimize_retina {
+                        let (screen, scale) = crate::windows_preview::display_metrics(&window)?;
+                        let scale_percent = if optimize_retina { scale } else { 100 };
+                        #[cfg(target_os = "macos")]
+                        let size = if resize_session {
+                            renderer.desktop_size(optimize_retina)
+                        } else if optimize_retina {
+                            screen
+                        } else {
+                            (
+                                (screen.0 * 100 + scale as usize / 2) / scale as usize,
+                                (screen.1 * 100 + scale as usize / 2) / scale as usize,
+                            )
+                        };
+                        #[cfg(target_os = "windows")]
+                        let size = if !resize_session {
+                            if optimize_retina {
+                                screen
+                            } else {
+                                crate::display_resize::logical_size(screen, scale * 96 / 100)
+                            }
+                        } else if optimize_retina {
                             window.get_size()
                         } else {
                             crate::windows_preview::logical_client_size(&window)
                         };
+                        if last_scale != Some(scale_percent) {
+                            resize = crate::display_resize::ResizeTracker::default();
+                            last_scale = Some(scale_percent);
+                        }
                         if shared.app == "Windows"
                             && let Some((width, height)) =
                                 resize.update(size, std::time::Instant::now())
                         {
-                            input
-                                .send(remote_protocol::Message::ResizeDesktop { width, height })?;
+                            println!(
+                                "请求远端显示：{width}×{height} 像素，桌面缩放 {scale_percent}%（{}）。",
+                                if resize_session {
+                                    "分辨率跟随窗口"
+                                } else {
+                                    "按客户端显示器，窗口仅缩放画面"
+                                }
+                            );
+                            input.send(remote_protocol::Message::ConfigureDisplay {
+                                display: remote_protocol::DesktopDisplay {
+                                    width,
+                                    height,
+                                    scale_percent,
+                                },
+                            })?;
                         }
                         match input.status() {
                             Status::Failed(error) => bail!("{error}"),
@@ -479,6 +531,7 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     _clipboard_stream: Option<ClipboardConnection<S>>,
     _clipboard_permissions: remote_session::clipboard::Permissions,
     _optimize_retina: bool,
+    _resize_session: bool,
 ) -> Result<()> {
     bail!("图形预览支持 macOS 和 Windows；当前平台可用 --save-frame preview.jpg 或 --check-only")
 }

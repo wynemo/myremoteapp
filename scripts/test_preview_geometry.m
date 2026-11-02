@@ -60,6 +60,12 @@ int main(void) {
         NSRect backing = [view convertRectToBacking:view.bounds];
         assert(pixelWidth == (size_t)llround(backing.size.width));
         assert(pixelHeight == (size_t)llround(backing.size.height));
+        uint32_t scalePercent = 0;
+        remote_preview_display_metrics((__bridge void *)view, &pixelWidth, &pixelHeight, &scalePercent);
+        assert(scalePercent == (uint32_t)llround(window.backingScaleFactor * 100));
+        NSRect screenBacking = [window convertRectToBacking:NSMakeRect(0, 0, window.screen.frame.size.width, window.screen.frame.size.height)];
+        assert(pixelWidth == (size_t)llround(screenBacking.size.width));
+        assert(pixelHeight == (size_t)llround(screenBacking.size.height));
         remote_preview_configure_window((__bridge void *)window, 1920, 1080);
         NSRect content = [window contentRectForFrameRect:window.frame];
         assert(content.size.width <= logical.size.width + 1);

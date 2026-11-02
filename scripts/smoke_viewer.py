@@ -148,6 +148,8 @@ def main():
                             received.append(message)
                             if message["type"] == "ping":
                                 send(stream, {"type": "pong", "sequence": message["sequence"]})
+                            elif message["type"] == "configure_display":
+                                send(stream, {"type": "display_configured", "requested": message["display"], "display": message["display"]})
                             elif message["type"] == "goodbye":
                                 break
                     else:
@@ -169,7 +171,8 @@ def main():
         try:
             client = subprocess.Popen(
                 [str(binary), "connect", "--address", address, "--connection-file",
-                 str(root / "host" / "connect.json")] + (["--optimize-retina"] if args.test_retina else []),
+                 str(root / "host" / "connect.json")] + (["--optimize-retina"] if args.test_retina else [])
+                + (["--resize-session"] if args.test_resize and not args.test_retina else []),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
             try:
                 if sys.platform == "win32" and args.test_keyboard:
@@ -198,9 +201,11 @@ def main():
             kinds = [message["type"] for message in received]
             assert "ping" in kinds and "release_input" in kinds and "goodbye" in kinds, received
             if args.test_resize:
-                requests = [message for message in received if message["type"] == "resize_desktop"]
+                requests = [message["display"] for message in received if message["type"] == "configure_display"]
                 assert len(requests) == 1, requests
                 assert requests[0]["width"] >= 320 and requests[0]["height"] >= 200, requests
+                assert requests[0]["scale_percent"] >= 100, requests
+                assert "远端显示已生效" in result.stdout, result
                 print("Desktop resize: stable client content size sent once; incoming frame size change does not feed back.")
             if args.test_mouse:
                 actions = [message["event"]["kind"] for message in received if message["type"] == "mouse"]

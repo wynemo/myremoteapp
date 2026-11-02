@@ -13,8 +13,8 @@ impl DesktopRect {
     pub fn frame_size(self) -> (u32, u32) {
         let width = f64::from(self.width.max(1));
         let height = f64::from(self.height.max(1));
-        let scale = (3840.0 / width.max(height))
-            .min(2160.0 / width.min(height))
+        let scale = (5120.0 / width.max(height))
+            .min(3200.0 / width.min(height))
             .min(1.0);
         // Floor avoids exceeding the protocol's pixel budget after rounding.
         (
@@ -87,7 +87,9 @@ mod tests {
             (1920, 1080, (1920, 1080)),
             (3840, 2160, (3840, 2160)),
             (2160, 3840, (2160, 3840)),
-            (7680, 2160, (3840, 1080)),
+            (3840, 2400, (3840, 2400)),
+            (5120, 3200, (5120, 3200)),
+            (7680, 2160, (5120, 1440)),
             (2000, 2000, (2000, 2000)),
         ] {
             let desktop = DesktopRect {

@@ -85,7 +85,7 @@ void *remote_preview_create(void *handle) {
 
 bool remote_preview_present(void *handle, const uint32_t *pixels, size_t width, size_t height) {
     RemotePreviewImageView *view = (__bridge RemotePreviewImageView *)handle;
-    if (!view || !pixels || !width || !height || width > 3840 || height > 3840 || width * height > 3840 * 2160) return false;
+    if (!view || !pixels || !width || !height || width > 5120 || height > 5120 || width * height > 5120 * 3200) return false;
     CFDataRef data = CFDataCreate(NULL, (const UInt8 *)pixels, width * height * 4);
     if (!data) return false;
     CGDataProviderRef provider = CGDataProviderCreateWithCFData(data);
@@ -136,6 +136,16 @@ void remote_preview_pixel_size(void *handle, size_t *width, size_t *height) {
     NSRect pixels = [view convertRectToBacking:view.bounds];
     *width = (size_t)MAX(0, llround(pixels.size.width));
     *height = (size_t)MAX(0, llround(pixels.size.height));
+}
+
+void remote_preview_display_metrics(void *handle, size_t *width, size_t *height, uint32_t *scale) {
+    RemotePreviewImageView *view = (__bridge RemotePreviewImageView *)handle;
+    NSWindow *window = view.window;
+    NSScreen *screen = window.screen ?: NSScreen.mainScreen;
+    NSRect pixels = [window convertRectToBacking:NSMakeRect(0, 0, screen.frame.size.width, screen.frame.size.height)];
+    *width = (size_t)MAX(0, llround(pixels.size.width));
+    *height = (size_t)MAX(0, llround(pixels.size.height));
+    *scale = (uint32_t)MAX(100, llround(window.backingScaleFactor * 100));
 }
 
 static void preview_key_transition(NSWindow *window, NSEvent *source, unsigned short key, BOOL down) {

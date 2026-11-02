@@ -15,7 +15,7 @@ pub struct DesktopResolution {
     applied: Option<(u32, u32)>,
 }
 
-fn current(device: &[u16; 32]) -> Result<DEVMODEW> {
+pub(crate) fn current(device: &[u16; 32]) -> Result<DEVMODEW> {
     let mut mode = DEVMODEW {
         dmSize: size_of::<DEVMODEW>() as u16,
         ..Default::default()
@@ -27,7 +27,7 @@ fn current(device: &[u16; 32]) -> Result<DEVMODEW> {
     Ok(mode)
 }
 
-fn primary() -> Result<[u16; 32]> {
+pub(crate) fn primary() -> Result<[u16; 32]> {
     ensure!(
         unsafe { GetSystemMetrics(SM_CMONITORS) } == 1,
         "自动分辨率目前支持单显示器；多屏继续等比例缩放画面"
@@ -88,6 +88,11 @@ fn apply(device: &[u16; 32], mode: &DEVMODEW) -> Result<()> {
 }
 
 impl DesktopResolution {
+    pub fn rollback(&mut self, device: &[u16; 32], mode: &DEVMODEW) -> Result<()> {
+        apply(device, mode)?;
+        self.applied = Some((mode.dmPelsWidth, mode.dmPelsHeight));
+        Ok(())
+    }
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
         let device = primary()?;
         let active = current(&device)?;

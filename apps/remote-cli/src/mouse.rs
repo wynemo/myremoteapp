@@ -386,6 +386,24 @@ mod connection {
                         Ok(Ok(Message::InputError { message })) => {
                             status_tx.send_replace(Status::Notice(message));
                         }
+                        Ok(Ok(Message::DisplayConfigured { requested, display })) => {
+                            println!(
+                                "远端显示已生效：{}×{} 像素，桌面缩放 {}%。",
+                                display.width, display.height, display.scale_percent
+                            );
+                            if (requested.width, requested.height)
+                                != (display.width, display.height)
+                            {
+                                eprintln!(
+                                    "远端显示器未支持请求的 {}×{}，实际为 {}×{}；完整匹配需要支持该模式的显示输出。",
+                                    requested.width,
+                                    requested.height,
+                                    display.width,
+                                    display.height
+                                );
+                            }
+                            status_tx.send_replace(Status::Ready);
+                        }
                         result => {
                             status_tx.send_replace(Status::Failed(format!(
                                 "控制连接已断开，请重新连接：{result:?}"

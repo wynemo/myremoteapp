@@ -316,6 +316,10 @@ enum InputCommand {
     Mouse(MouseEvent),
     Key(KeyEvent),
     Resize(u32, u32),
+    Configure(
+        remote_protocol::DesktopDisplay,
+        std::sync::mpsc::SyncSender<Result<remote_protocol::DesktopDisplay>>,
+    ),
     ReleaseMouse,
     ReleaseKeyboard,
     ReleaseAll,
@@ -358,6 +362,7 @@ impl InputController for ThreadController {
                 // Rebind only when the active desktop actually changes.
                 let mut desktop = Some(desktop);
                 let mut resolution = crate::windows_display::DesktopResolution::default();
+                let mut dpi = crate::windows_dpi::DesktopDpi::default();
                 while let Ok((command, reply)) = receiver.recv() {
                     let result = (|| -> Result<()> {
                         let current =
@@ -367,6 +372,45 @@ impl InputController for ThreadController {
                             desktop = Some(DesktopBinding::open()?);
                         }
                         match command {
+                            InputCommand::Configure(display, reply) => {
+                                let result = (|| -> Result<remote_protocol::DesktopDisplay> {
+                                    ensure!(
+                                        current.eq_ignore_ascii_case("Default"),
+                                        "锁屏期间暂不调整显示配置，请解锁后重新连接"
+                                    );
+                                    let device = crate::windows_display::primary()?;
+                                    dpi.remember(&device)?;
+                                    let previous_mode = crate::windows_display::current(&device)?;
+                                    let previous_scale =
+                                        crate::windows_dpi::current_scale(&device)?;
+                                    session.release_all();
+                                    let applied =
+                                        (|| -> Result<remote_protocol::DesktopDisplay> {
+                                            resolution.resize(display.width, display.height)?;
+                                            let scale_percent =
+                                                dpi.apply(&device, display.scale_percent)?;
+                                            let actual = crate::windows_display::current(&device)?;
+                                            Ok(remote_protocol::DesktopDisplay {
+                                                width: actual.dmPelsWidth,
+                                                height: actual.dmPelsHeight,
+                                                scale_percent,
+                                            })
+                                        })();
+                                    if applied.is_err() {
+                                        if let Err(error) =
+                                            resolution.rollback(&device, &previous_mode)
+                                        {
+                                            eprintln!("回退分辨率失败：{error:#}");
+                                        }
+                                        if let Err(error) = dpi.apply(&device, previous_scale) {
+                                            eprintln!("回退桌面 DPI 失败：{error:#}");
+                                        }
+                                    }
+                                    applied
+                                })();
+                                let _ = reply.send(result);
+                                Ok(())
+                            }
                             InputCommand::Resize(width, height) => {
                                 ensure!(
                                     current.eq_ignore_ascii_case("Default"),
@@ -395,6 +439,7 @@ impl InputController for ThreadController {
                 }
                 // session releases all held input before the impersonation ends.
                 drop(resolution);
+                drop(dpi);
                 drop(session);
                 drop(desktop);
             })
@@ -422,6 +467,14 @@ impl ThreadSession {
     }
 }
 impl InputSession for ThreadSession {
+    fn configure_display(
+        &mut self,
+        display: remote_protocol::DesktopDisplay,
+    ) -> Result<remote_protocol::DesktopDisplay> {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        self.request(InputCommand::Configure(display, reply))?;
+        result.recv().context("Windows 显示配置线程未响应")?
+    }
     fn resize_desktop(&mut self, width: u32, height: u32) -> Result<()> {
         self.request(InputCommand::Resize(width, height))
     }

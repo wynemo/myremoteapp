@@ -36,6 +36,31 @@ pub fn logical_client_size(window: &minifb::Window) -> (usize, usize) {
     crate::display_resize::logical_size(window.get_size(), dpi)
 }
 
+pub fn display_metrics(window: &minifb::Window) -> Result<((usize, usize), u32)> {
+    let handle = window.get_window_handle();
+    let dpi = unsafe { GetDpiForWindow(handle) }.max(96);
+    let mut monitor = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    ensure!(
+        unsafe {
+            GetMonitorInfoW(
+                MonitorFromWindow(handle, MONITOR_DEFAULTTONEAREST),
+                &mut monitor,
+            )
+        } != 0,
+        "无法读取客户端显示器尺寸"
+    );
+    Ok((
+        (
+            (monitor.rcMonitor.right - monitor.rcMonitor.left) as usize,
+            (monitor.rcMonitor.bottom - monitor.rcMonitor.top) as usize,
+        ),
+        (dpi * 100 + 48) / 96,
+    ))
+}
+
 pub fn configure(window: &minifb::Window, pixels: (usize, usize)) -> Result<()> {
     let handle = window.get_window_handle();
     let dpi = unsafe { GetDpiForWindow(handle) }.max(96);

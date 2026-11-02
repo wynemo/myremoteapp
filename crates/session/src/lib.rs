@@ -63,6 +63,12 @@ pub trait InputSession: Send {
     fn resize_desktop(&mut self, _width: u32, _height: u32) -> Result<()> {
         bail!("当前共享不支持调整桌面分辨率")
     }
+    fn configure_display(
+        &mut self,
+        _display: remote_protocol::DesktopDisplay,
+    ) -> Result<remote_protocol::DesktopDisplay> {
+        bail!("服务端尚不支持桌面 DPI 协商")
+    }
     fn apply_key(&mut self, _event: KeyEvent) -> Result<()> {
         bail!("服务端未启用键盘输入")
     }
@@ -267,6 +273,34 @@ pub async fn serve_with_clipboard<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 .await?;
                 loop {
                     match timeout(IO_TIMEOUT, read_message(stream)).await?? {
+                        Message::ConfigureDisplay { display } => {
+                            let requested = display;
+                            let result = if display.valid() {
+                                input.configure_display(display)
+                            } else {
+                                Err(anyhow::anyhow!(
+                                    "显示配置超出支持范围：{}×{} @ {}%",
+                                    display.width,
+                                    display.height,
+                                    display.scale_percent
+                                ))
+                            };
+                            match result {
+                                Ok(display) => {
+                                    send(stream, &Message::DisplayConfigured { requested, display })
+                                        .await?
+                                }
+                                Err(error) => {
+                                    send(
+                                        stream,
+                                        &Message::InputError {
+                                            message: error.to_string(),
+                                        },
+                                    )
+                                    .await?
+                                }
+                            }
+                        }
                         Message::ResizeDesktop { width, height } => {
                             let result = if (320..=8192).contains(&width)
                                 && (200..=8192).contains(&height)
@@ -863,6 +897,92 @@ mod tests {
         host.abort();
         let _ = host.await;
         assert!(!pressed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn display_negotiates_dpi_and_returns_actual_not_requested_size() {
+        use remote_protocol::DesktopDisplay;
+        struct Controller(Arc<std::sync::Mutex<Vec<DesktopDisplay>>>);
+        struct Input(Arc<std::sync::Mutex<Vec<DesktopDisplay>>>);
+        impl InputController for Controller {
+            fn acquire(&self) -> Result<Box<dyn InputSession>> {
+                Ok(Box::new(Input(self.0.clone())))
+            }
+        }
+        impl InputSession for Input {
+            fn apply(&mut self, _: MouseEvent) -> Result<()> {
+                Ok(())
+            }
+            fn release_all(&mut self) {}
+            fn configure_display(&mut self, display: DesktopDisplay) -> Result<DesktopDisplay> {
+                self.0.lock().unwrap().push(display);
+                Ok(DesktopDisplay {
+                    width: 1920,
+                    height: 1200,
+                    scale_percent: display.scale_percent,
+                })
+            }
+        }
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (_sender, frames) = watch::channel(None);
+        let source = PreviewSource {
+            window: WindowInfo {
+                id: 5,
+                app: "Windows".into(),
+                title: "Test".into(),
+                width: 1920,
+                height: 1200,
+            },
+            frames,
+            demand: PreviewDemand::default(),
+            input: Some(Arc::new(Controller(requests.clone()))),
+        };
+        let (mut client, mut server) = tokio::io::duplex(2048);
+        let host = tokio::spawn(async move { serve_with_preview(&mut server, Some(source)).await });
+        start_control(&mut client, 5).await.unwrap();
+        let requested = DesktopDisplay {
+            width: 3840,
+            height: 2400,
+            scale_percent: 200,
+        };
+        send(
+            &mut client,
+            &Message::ConfigureDisplay { display: requested },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_message(&mut client).await.unwrap(),
+            Message::DisplayConfigured {
+                requested,
+                display: DesktopDisplay {
+                    width: 1920,
+                    height: 1200,
+                    scale_percent: 200
+                }
+            }
+        );
+        for display in [
+            DesktopDisplay {
+                scale_percent: 0,
+                ..requested
+            },
+            DesktopDisplay {
+                width: u32::MAX,
+                ..requested
+            },
+        ] {
+            send(&mut client, &Message::ConfigureDisplay { display })
+                .await
+                .unwrap();
+            assert!(matches!(
+                read_message(&mut client).await.unwrap(),
+                Message::InputError { .. }
+            ));
+        }
+        assert_eq!(*requests.lock().unwrap(), vec![requested]);
+        send(&mut client, &Message::Goodbye).await.unwrap();
+        host.await.unwrap().unwrap();
     }
 
     #[tokio::test]

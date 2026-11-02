@@ -27,6 +27,8 @@ mod windows_console;
 #[cfg(target_os = "windows")]
 mod windows_display;
 #[cfg(target_os = "windows")]
+mod windows_dpi;
+#[cfg(target_os = "windows")]
 mod windows_host;
 #[cfg(target_os = "windows")]
 mod windows_preview;
@@ -158,9 +160,12 @@ enum Command {
         /// 只观看画面，不建立键鼠控制连接。
         #[arg(long, conflicts_with_all = ["save_frame", "check_only"])]
         view_only: bool,
-        /// 优化 Retina / 高 DPI 显示：按客户端物理像素调整 Windows 桌面，最高 4K。
+        /// 匹配客户端 Retina / 高 DPI 显示：协商像素尺寸和 Windows 桌面缩放。
         #[arg(long, conflicts_with_all = ["save_frame", "check_only"])]
         optimize_retina: bool,
+        /// 拖动客户端窗口时更新远端分辨率；默认只缩放显示，保持会话分辨率。
+        #[arg(long, conflicts_with_all = ["save_frame", "check_only", "view_only"])]
+        resize_session: bool,
         /// 剪贴板：off / both / send（本端发送）/ receive（本端接收）。只观看时关闭。
         #[arg(long, value_enum, default_value = "both")]
         clipboard: ClipboardMode,
@@ -206,6 +211,7 @@ async fn main() -> Result<()> {
             save_frame,
             view_only,
             optimize_retina,
+            resize_session,
             clipboard,
         } => {
             let connection = pairing::ConnectionFile::load(&connection_file)
@@ -285,6 +291,7 @@ async fn main() -> Result<()> {
                     clipboard_stream,
                     clipboard.permissions(),
                     optimize_retina,
+                    resize_session,
                 )
                 .await?;
             }

@@ -3,13 +3,30 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, ErrorKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const VERSION: u16 = 8;
+pub const VERSION: u16 = 9;
 pub const MAX_PASSWORD_BYTES: usize = 4096;
 pub const MAX_CONTROL_BYTES: usize = 64 * 1024;
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
-pub const MAX_FRAME_WIDTH: u32 = 3840;
-pub const MAX_FRAME_HEIGHT: u32 = 3840;
-pub const MAX_FRAME_PIXELS: usize = 3840 * 2160;
+pub const MAX_FRAME_WIDTH: u32 = 5120;
+pub const MAX_FRAME_HEIGHT: u32 = 5120;
+pub const MAX_FRAME_PIXELS: usize = 5120 * 3200;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopDisplay {
+    pub width: u32,
+    pub height: u32,
+    pub scale_percent: u32,
+}
+
+impl DesktopDisplay {
+    pub fn valid(self) -> bool {
+        (320..=5120).contains(&self.width)
+            && (200..=5120).contains(&self.height)
+            && validate_frame_size(self.width, self.height).is_ok()
+            && (100..=500).contains(&self.scale_percent)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -222,6 +239,13 @@ pub enum Message {
         width: u32,
         height: u32,
     },
+    ConfigureDisplay {
+        display: DesktopDisplay,
+    },
+    DisplayConfigured {
+        requested: DesktopDisplay,
+        display: DesktopDisplay,
+    },
     ControlReady {
         #[serde(default)]
         clipboard_token: Option<String>,
@@ -433,7 +457,8 @@ mod tests {
         assert!(validate_frame_size(2560, 1440).is_ok());
         assert!(validate_frame_size(3840, 2160).is_ok());
         assert!(validate_frame_size(2160, 3840).is_ok());
-        assert!(validate_frame_size(3840, 3840).is_err());
+        assert!(validate_frame_size(3840, 2400).is_ok());
+        assert!(validate_frame_size(5120, 5120).is_err());
         assert!(validate_frame_size(0, 100).is_err());
     }
 

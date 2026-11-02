@@ -1,5 +1,36 @@
 use std::time::{Duration, Instant};
 
+#[cfg(any(target_os = "windows", test))]
+const DPI_STEPS: [u32; 12] = [100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500];
+
+#[cfg(any(target_os = "windows", test))]
+pub fn dpi_percent(minimum: i32, relative: i32, maximum: i32) -> anyhow::Result<u32> {
+    anyhow::ensure!(
+        (-11..=0).contains(&minimum) && maximum >= 0 && relative >= minimum && relative <= maximum,
+        "Windows 返回无效的 DPI 范围"
+    );
+    let index = i64::from(relative) - i64::from(minimum);
+    DPI_STEPS
+        .get(index as usize)
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("未知 Windows DPI 档位"))
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub fn dpi_relative(minimum: i32, maximum: i32, percent: u32) -> anyhow::Result<i32> {
+    let index = DPI_STEPS
+        .iter()
+        .position(|value| *value == percent)
+        .ok_or_else(|| anyhow::anyhow!("Windows 不支持 {percent}% 缩放档位"))?
+        as i32;
+    let relative = index + minimum;
+    anyhow::ensure!(
+        dpi_percent(minimum, relative, maximum).is_ok(),
+        "显示器不支持 {percent}% 缩放"
+    );
+    Ok(relative)
+}
+
 /// Windows reports physical client pixels under Per-Monitor V2 awareness.
 /// macOS reports view bounds in points and must not be divided a second time.
 #[cfg(any(target_os = "windows", test))]
@@ -56,6 +87,16 @@ pub fn mode_distance(size: (u32, u32), target: (u32, u32)) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dpi_offsets_follow_the_recommended_step_without_clamping() {
+        assert_eq!(dpi_percent(-3, 1, 5).unwrap(), 200);
+        assert_eq!(dpi_relative(-3, 5, 200).unwrap(), 1);
+        assert_eq!(dpi_relative(-3, 5, 100).unwrap(), -3);
+        assert!(dpi_relative(0, 2, 200).is_err());
+        assert!(dpi_relative(-3, 5, 133).is_err());
+        assert!(dpi_percent(i32::MIN, i32::MAX, i32::MAX).is_err());
+    }
 
     #[test]
     fn four_k_at_two_hundred_percent_is_full_hd_logical_space() {
