@@ -1,5 +1,25 @@
 use std::time::{Duration, Instant};
 
+/// Windows reports physical client pixels under Per-Monitor V2 awareness.
+/// macOS reports view bounds in points and must not be divided a second time.
+#[cfg(any(target_os = "windows", test))]
+pub fn logical_size(pixels: (usize, usize), dpi: u32) -> (usize, usize) {
+    let dpi = u64::from(dpi.max(96));
+    let convert = |value: usize| ((value as u64 * 96 + dpi / 2) / dpi) as usize;
+    (convert(pixels.0), convert(pixels.1))
+}
+
+/// Fit received pixel dimensions into the local work area without changing aspect.
+pub fn fit_size(size: (usize, usize), available: (usize, usize)) -> (usize, usize) {
+    let scale = (available.0 as f64 / size.0.max(1) as f64)
+        .min(available.1 as f64 / size.1.max(1) as f64)
+        .min(1.0);
+    (
+        (size.0 as f64 * scale).floor().max(1.0) as usize,
+        (size.1 as f64 * scale).floor().max(1.0) as usize,
+    )
+}
+
 /// Wait for live resize to settle; never feed received frame sizes back to the host.
 #[derive(Default)]
 pub struct ResizeTracker {
@@ -36,6 +56,15 @@ pub fn mode_distance(size: (u32, u32), target: (u32, u32)) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn four_k_at_two_hundred_percent_is_full_hd_logical_space() {
+        assert_eq!(logical_size((3840, 2160), 192), (1920, 1080));
+        assert_eq!(logical_size((3840, 2160), 144), (2560, 1440));
+        assert_eq!(logical_size((1920, 1080), 96), (1920, 1080));
+        assert_eq!(fit_size((3840, 2160), (1920, 1000)), (1777, 1000));
+        assert_eq!(fit_size((1080, 1920), (1920, 1000)), (562, 1000));
+    }
 
     #[test]
     fn sends_only_settled_sizes_and_ignores_minimize() {

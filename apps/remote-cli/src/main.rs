@@ -29,6 +29,8 @@ mod windows_display;
 #[cfg(target_os = "windows")]
 mod windows_host;
 #[cfg(target_os = "windows")]
+mod windows_preview;
+#[cfg(target_os = "windows")]
 mod windows_privilege;
 #[cfg(target_os = "macos")]
 mod workspace_macos;

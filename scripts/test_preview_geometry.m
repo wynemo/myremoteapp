@@ -53,6 +53,16 @@ int main(void) {
         // Outside points must remain outside for Rust to reject letterboxing.
         check_point(view, -1, -1, 800, 600);
         check_point(view, 801, 601, 800, 600);
+        // Convert incoming pixels to AppKit points once and fit the work area.
+        NSRect logical = [window convertRectFromBacking:NSMakeRect(0, 0, 1920, 1080)];
+        remote_preview_configure_window((__bridge void *)window, 1920, 1080);
+        NSRect content = [window contentRectForFrameRect:window.frame];
+        assert(content.size.width <= logical.size.width + 1);
+        assert(content.size.height <= logical.size.height + 1);
+        NSRect work = window.screen.visibleFrame;
+        assert(window.frame.size.width <= work.size.width + 1);
+        assert(window.frame.size.height <= work.size.height + 1);
+        assert(fabs(content.size.width / content.size.height - 1920.0 / 1080.0) < 0.01);
         puts("Native preview coordinates: offset origin, flipped Y, landscape/portrait, live resize and outside points passed.");
     }
     return 0;

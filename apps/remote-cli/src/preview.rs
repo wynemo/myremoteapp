@@ -118,10 +118,13 @@ pub async fn save_frame<S: AsyncRead + AsyncWrite + Unpin>(
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn native_window(title: &str, frame: &DecodedFrame) -> Result<minifb::Window> {
     use minifb::{ScaleMode, Window, WindowOptions};
+    #[cfg(target_os = "windows")]
+    let _dpi = crate::windows_preview::DpiContext::enter()?;
+    let initial = crate::display_resize::fit_size((frame.width, frame.height), (960, 540));
     let mut window = Window::new(
         title,
-        frame.width,
-        frame.height,
+        initial.0,
+        initial.1,
         WindowOptions {
             resize: true,
             scale_mode: ScaleMode::AspectRatioStretch,
@@ -129,6 +132,19 @@ fn native_window(title: &str, frame: &DecodedFrame) -> Result<minifb::Window> {
         },
     )
     .context("无法创建预览窗口")?;
+    #[cfg(target_os = "macos")]
+    unsafe {
+        unsafe extern "C" {
+            fn remote_preview_configure_window(
+                window: *mut std::ffi::c_void,
+                width: usize,
+                height: usize,
+            );
+        }
+        remote_preview_configure_window(window.get_window_handle(), frame.width, frame.height);
+    }
+    #[cfg(target_os = "windows")]
+    crate::windows_preview::configure(&window, (frame.width, frame.height))?;
     window.set_target_fps(60);
     Ok(window)
 }
@@ -303,6 +319,8 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             "仅观看"
         }
     );
+    #[cfg(target_os = "windows")]
+    let _dpi = crate::windows_preview::DpiContext::enter()?;
     let mut window = native_window(&title, &first)?;
     let keyboard_queue = KeyboardQueue::default();
     if input.is_some() {
@@ -362,7 +380,7 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         #[cfg(target_os = "macos")]
                         let size = renderer.mouse_geometry().1;
                         #[cfg(target_os = "windows")]
-                        let size = window.get_size();
+                        let size = crate::windows_preview::logical_client_size(&window);
                         if shared.app == "Windows"
                             && let Some((width, height)) =
                                 resize.update(size, std::time::Instant::now())
@@ -569,8 +587,21 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn native_window_presents_a_decoded_frame() {
+        use windows_sys::Win32::UI::HiDpi::{
+            AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            GetWindowDpiAwarenessContext,
+        };
         let frame = decode(&image()).unwrap();
         let mut window = native_window("MyRemoteApp CI preview check", &frame).unwrap();
+        assert_ne!(
+            unsafe {
+                AreDpiAwarenessContextsEqual(
+                    GetWindowDpiAwarenessContext(window.get_window_handle()),
+                    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+                )
+            },
+            0
+        );
         window
             .update_with_buffer(&frame.pixels, frame.width, frame.height)
             .unwrap();

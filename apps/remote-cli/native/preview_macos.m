@@ -3,6 +3,25 @@
 #import <QuartzCore/QuartzCore.h>
 #include <stdbool.h>
 
+// Frame dimensions are pixels; AppKit window dimensions are logical points.
+void remote_preview_configure_window(void *handle, size_t width, size_t height) {
+    NSWindow *window = (__bridge NSWindow *)handle;
+    NSScreen *screen = window.screen ?: NSScreen.mainScreen;
+    NSRect work = screen.visibleFrame;
+    NSRect desired = [window convertRectFromBacking:NSMakeRect(0, 0, width, height)];
+    NSRect chrome = [window frameRectForContentRect:NSMakeRect(0, 0, 0, 0)];
+    double availableWidth = MAX(1, work.size.width - chrome.size.width);
+    double availableHeight = MAX(1, work.size.height - chrome.size.height);
+    double fit = MIN(1, MIN(availableWidth / MAX(1, desired.size.width),
+                            availableHeight / MAX(1, desired.size.height)));
+    [window setContentSize:NSMakeSize(MAX(1, floor(desired.size.width * fit)),
+                                      MAX(1, floor(desired.size.height * fit)))];
+    NSRect frame = window.frame;
+    frame.origin.x = work.origin.x + (work.size.width - frame.size.width) / 2;
+    frame.origin.y = work.origin.y + (work.size.height - frame.size.height) / 2;
+    [window setFrame:frame display:YES];
+}
+
 // The image layer is separate from minifb's nearest-neighbour Metal renderer.
 // The original content view keeps handling all input; this overlay never hits.
 @interface RemotePreviewImageView : NSView
