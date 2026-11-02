@@ -58,6 +58,8 @@ def main():
                         help="macOS local input regression check (requires Accessibility)")
     parser.add_argument("--test-keyboard", action="store_true",
                         help="exercise native key capture (macOS needs Accessibility)")
+    parser.add_argument("--test-resize", action="store_true",
+                        help="verify window-size requests to a synthetic Windows host")
     args = parser.parse_args()
     binary = args.binary.resolve()
     with tempfile.TemporaryDirectory(prefix="myremoteapp-viewer-") as directory:
@@ -121,10 +123,11 @@ def main():
                         assert receive(stream)["type"] == "goodbye"
                     elif command["type"] == "start_preview":
                         send(stream, {"type": "preview_started", "window": {
-                            "id": 1, "app": "MyRemoteApp fixture", "title": "Native viewer test",
-                            "width": 320, "height": 180}})
+                            "id": 1, "app": "Windows" if args.test_resize else "MyRemoteApp fixture", "title": "Native viewer test",
+                            "width": 960 if args.test_resize else 320, "height": 540 if args.test_resize else 180}})
                         sequence = 0
-                        for width, height in [(320, 180), (180, 320)]:
+                        dimensions = [(960, 540), (540, 960)] if args.test_resize else [(320, 180), (180, 320)]
+                        for width, height in dimensions:
                             jpeg = gray_jpeg(width, height)
                             for _ in range(25 if args.test_keyboard else 10):
                                 stream.sendall(struct.pack("!IIIQ", len(jpeg), width,
@@ -183,10 +186,16 @@ def main():
                 worker.join(timeout=2)
             assert not errors, errors
             assert video_done.is_set(), "synthetic video did not finish"
-            assert "320×180" in result.stdout and "180×320" in result.stdout, result
+            expected_sizes = ["960×540", "540×960"] if args.test_resize else ["320×180", "180×320"]
+            assert all(size in result.stdout for size in expected_sizes), result
             assert result.returncode == 1 and "采集已停止" in result.stderr, result
             kinds = [message["type"] for message in received]
             assert "ping" in kinds and "release_input" in kinds and "goodbye" in kinds, received
+            if args.test_resize:
+                requests = [message for message in received if message["type"] == "resize_desktop"]
+                assert len(requests) == 1, requests
+                assert requests[0]["width"] >= 320 and requests[0]["height"] >= 200, requests
+                print("Desktop resize: stable client content size sent once; incoming frame size change does not feed back.")
             if args.test_mouse:
                 actions = [message["event"]["kind"] for message in received if message["type"] == "mouse"]
                 for button in ["left", "right"]:

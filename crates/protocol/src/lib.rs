@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, ErrorKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const VERSION: u16 = 6;
+pub const VERSION: u16 = 7;
 pub const MAX_PASSWORD_BYTES: usize = 4096;
 pub const MAX_CONTROL_BYTES: usize = 64 * 1024;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -217,6 +217,10 @@ pub enum Message {
     },
     StartControl {
         window_id: u32,
+    },
+    ResizeDesktop {
+        width: u32,
+        height: u32,
     },
     ControlReady {
         #[serde(default)]

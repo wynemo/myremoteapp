@@ -208,6 +208,8 @@ pub fn start(view_only: bool, experimental_lock_screen: bool) -> Result<CaptureS
             }
             let mut sequence = 0;
             let mut sharing = false;
+            let mut last_rect = rect;
+            let mut display_recovery_until = Instant::now();
             let mut recovery =
                 crate::desktop_recovery::DesktopRecovery::new(experimental_lock_screen);
             while !stopped.load(Ordering::Acquire) {
@@ -230,6 +232,12 @@ pub fn start(view_only: bool, experimental_lock_screen: bool) -> Result<CaptureS
                     );
                     let binding = DesktopBinding::open()?;
                     let rect = desktop_rect()?;
+                    if rect != last_rect {
+                        // A mode switch can briefly invalidate GDI surfaces even
+                        // on the ordinary desktop. Keep the same video connection.
+                        display_recovery_until = Instant::now() + Duration::from_secs(5);
+                        last_rect = rect;
+                    }
                     let frame = capture(rect, sequence)?;
                     ensure!(
                         current_desktop_name().as_deref() == Some(&binding.name),
@@ -246,7 +254,8 @@ pub fn start(view_only: bool, experimental_lock_screen: bool) -> Result<CaptureS
                     }
                     Err(error) => {
                         controller.stop();
-                        if recovery.retry(Instant::now()) {
+                        if Instant::now() < display_recovery_until || recovery.retry(Instant::now())
+                        {
                             // None pauses this preview without sending an end marker.
                             // Clear stale imagery and input until the new desktop is ready.
                             sender.send_replace(None);
@@ -306,6 +315,7 @@ struct ThreadController {
 enum InputCommand {
     Mouse(MouseEvent),
     Key(KeyEvent),
+    Resize(u32, u32),
     ReleaseMouse,
     ReleaseKeyboard,
     ReleaseAll,
@@ -347,6 +357,7 @@ impl InputController for ThreadController {
                 // Keep the input queue attached between keydown/keyup events.
                 // Rebind only when the active desktop actually changes.
                 let mut desktop = Some(desktop);
+                let mut resolution = crate::windows_display::DesktopResolution::default();
                 while let Ok((command, reply)) = receiver.recv() {
                     let result = (|| -> Result<()> {
                         let current =
@@ -356,6 +367,14 @@ impl InputController for ThreadController {
                             desktop = Some(DesktopBinding::open()?);
                         }
                         match command {
+                            InputCommand::Resize(width, height) => {
+                                ensure!(
+                                    current.eq_ignore_ascii_case("Default"),
+                                    "锁屏期间暂不调整分辨率，请解锁后调整窗口"
+                                );
+                                session.release_all();
+                                resolution.resize(width, height)
+                            }
                             InputCommand::Mouse(event) => session.apply(event),
                             InputCommand::Key(event) => session.apply_key(event),
                             InputCommand::ReleaseMouse => {
@@ -375,6 +394,7 @@ impl InputController for ThreadController {
                     let _ = reply.send(result);
                 }
                 // session releases all held input before the impersonation ends.
+                drop(resolution);
                 drop(session);
                 drop(desktop);
             })
@@ -402,6 +422,9 @@ impl ThreadSession {
     }
 }
 impl InputSession for ThreadSession {
+    fn resize_desktop(&mut self, width: u32, height: u32) -> Result<()> {
+        self.request(InputCommand::Resize(width, height))
+    }
     fn apply(&mut self, event: MouseEvent) -> Result<()> {
         self.request(InputCommand::Mouse(event))
     }

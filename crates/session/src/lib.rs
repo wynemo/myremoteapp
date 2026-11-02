@@ -60,6 +60,9 @@ pub trait InputController: Send + Sync {
 /// Implementors release all held buttons in Drop, including task cancellation.
 pub trait InputSession: Send {
     fn apply(&mut self, event: MouseEvent) -> Result<()>;
+    fn resize_desktop(&mut self, _width: u32, _height: u32) -> Result<()> {
+        bail!("当前共享不支持调整桌面分辨率")
+    }
     fn apply_key(&mut self, _event: KeyEvent) -> Result<()> {
         bail!("服务端未启用键盘输入")
     }
@@ -264,6 +267,24 @@ pub async fn serve_with_clipboard<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 .await?;
                 loop {
                     match timeout(IO_TIMEOUT, read_message(stream)).await?? {
+                        Message::ResizeDesktop { width, height } => {
+                            let result = if (320..=8192).contains(&width)
+                                && (200..=8192).contains(&height)
+                            {
+                                input.resize_desktop(width, height)
+                            } else {
+                                Err(anyhow::anyhow!("请求的桌面尺寸无效"))
+                            };
+                            if let Err(error) = result {
+                                send(
+                                    stream,
+                                    &Message::InputError {
+                                        message: error.to_string(),
+                                    },
+                                )
+                                .await?;
+                            }
+                        }
                         Message::Mouse { event } => {
                             if let Err(error) = input.apply(event) {
                                 input.release_all();
@@ -723,6 +744,76 @@ mod tests {
         fn drop(&mut self) {
             self.release_all();
         }
+    }
+
+    #[tokio::test]
+    async fn desktop_resize_is_validated_and_does_not_end_control() {
+        struct ResizeController(Arc<std::sync::Mutex<Vec<(u32, u32)>>>);
+        struct ResizeInput(Arc<std::sync::Mutex<Vec<(u32, u32)>>>);
+        impl InputController for ResizeController {
+            fn acquire(&self) -> Result<Box<dyn InputSession>> {
+                Ok(Box::new(ResizeInput(self.0.clone())))
+            }
+        }
+        impl InputSession for ResizeInput {
+            fn apply(&mut self, _: MouseEvent) -> Result<()> {
+                Ok(())
+            }
+            fn release_all(&mut self) {}
+            fn resize_desktop(&mut self, width: u32, height: u32) -> Result<()> {
+                self.0.lock().unwrap().push((width, height));
+                Ok(())
+            }
+        }
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (_sender, frames) = watch::channel(None);
+        let source = PreviewSource {
+            window: WindowInfo {
+                id: 5,
+                app: "Windows".into(),
+                title: "Test".into(),
+                width: 1920,
+                height: 1080,
+            },
+            frames,
+            demand: PreviewDemand::default(),
+            input: Some(Arc::new(ResizeController(requests.clone()))),
+        };
+        let (mut client, mut server) = tokio::io::duplex(2048);
+        let host = tokio::spawn(async move { serve_with_preview(&mut server, Some(source)).await });
+        start_control(&mut client, 5).await.unwrap();
+        send(
+            &mut client,
+            &Message::ResizeDesktop {
+                width: 0,
+                height: u32::MAX,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_message(&mut client).await.unwrap(),
+            Message::InputError { .. }
+        ));
+        send(
+            &mut client,
+            &Message::ResizeDesktop {
+                width: 1280,
+                height: 720,
+            },
+        )
+        .await
+        .unwrap();
+        send(&mut client, &Message::Ping { sequence: 9 })
+            .await
+            .unwrap();
+        assert_eq!(
+            read_message(&mut client).await.unwrap(),
+            Message::Pong { sequence: 9 }
+        );
+        assert_eq!(*requests.lock().unwrap(), vec![(1280, 720)]);
+        send(&mut client, &Message::Goodbye).await.unwrap();
+        host.await.unwrap().unwrap();
     }
 
     #[tokio::test]

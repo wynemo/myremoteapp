@@ -342,6 +342,7 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let mut mouse = MouseTracker::default();
     let mut notice = None;
     let mut displayed_dimensions = None;
+    let mut resize = crate::display_resize::ResizeTracker::default();
     let result = (|| -> Result<()> {
         while window.is_open() {
             let current = receiver.borrow().clone();
@@ -358,6 +359,17 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     #[cfg(target_os = "windows")]
                     window.update_with_buffer(&frame.pixels, frame.width, frame.height)?;
                     if let Some(input) = &input {
+                        #[cfg(target_os = "macos")]
+                        let size = renderer.mouse_geometry().1;
+                        #[cfg(target_os = "windows")]
+                        let size = window.get_size();
+                        if shared.app == "Windows"
+                            && let Some((width, height)) =
+                                resize.update(size, std::time::Instant::now())
+                        {
+                            input
+                                .send(remote_protocol::Message::ResizeDesktop { width, height })?;
+                        }
                         match input.status() {
                             Status::Failed(error) => bail!("{error}"),
                             Status::Notice(error) => {

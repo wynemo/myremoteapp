@@ -8,6 +8,8 @@ mod clipboard;
 mod desktop_geometry;
 #[cfg(any(target_os = "windows", test))]
 mod desktop_recovery;
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
+mod display_resize;
 #[cfg(target_os = "macos")]
 mod input_macos;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -22,6 +24,8 @@ mod preview;
 mod unlock_macos;
 #[cfg(target_os = "windows")]
 mod windows_console;
+#[cfg(target_os = "windows")]
+mod windows_display;
 #[cfg(target_os = "windows")]
 mod windows_host;
 #[cfg(target_os = "windows")]

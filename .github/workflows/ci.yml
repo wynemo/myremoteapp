@@ -85,6 +85,10 @@ jobs:
         if: runner.os == 'macOS'
         run: bash scripts/test_preview_geometry.sh
 
+      - name: Test native Windows desktop resize and restore
+        if: runner.os == 'Windows'
+        run: cargo test --locked --release -p remote-cli --target ${{ matrix.target }} windows_display::tests::native_desktop_resize_and_restore -- --ignored --exact --test-threads=1
+
       - name: Build release binary
         run: cargo build --locked --release -p remote-cli --target ${{ matrix.target }}
 
@@ -107,6 +111,7 @@ jobs:
           args=(--binary "$binary")
           if [[ "$RUNNER_OS" == Windows ]]; then args+=(--test-keyboard); fi
           python scripts/smoke_viewer.py "${args[@]}"
+          python scripts/smoke_viewer.py --binary "$binary" --test-resize
 
       # Run last among GUI operations: this may lock the ephemeral CI VM.
       # Require real password submission to restore the original desktop.

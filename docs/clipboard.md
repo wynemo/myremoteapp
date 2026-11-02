@@ -1,4 +1,4 @@
-# 双向剪贴板（v6）
+# 双向剪贴板（v7）
 
 支持 macOS / Windows 用户会话之间的纯文本与单张位图图片复制。网络格式为 UTF-8 和 PNG，保留 Unicode、多行文本及图片透明度。文件列表、文件夹、HTML/RTF、动画图片和剪贴板历史不在首版范围内；复制图片文件不会变成文件传输。
 
@@ -14,7 +14,7 @@
 
 剪贴板使用第三条独立的双向 TLS 连接，同一监听端口、设备身份和 SOCKS5 路由，无新增端口或证书操作。大图片不进入键鼠队列或视频流。
 
-取得独占键鼠控制权后，`control_ready` 返回一个随机 256 位 `clipboard_token`。剪贴板连接经过 Hello/Welcome v6 后发送：
+取得独占键鼠控制权后，`control_ready` 返回一个随机 256 位 `clipboard_token`。剪贴板连接经过 Hello/Welcome v7 后发送：
 
 ```json
 {"type":"start_clipboard","token":"<64 hex characters>","send":true,"receive":true}
