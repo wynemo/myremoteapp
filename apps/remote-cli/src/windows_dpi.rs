@@ -132,6 +132,9 @@ impl DesktopDpi {
     }
     pub fn apply(&mut self, device: &[u16; 32], scale: u32) -> Result<u32> {
         self.remember(device)?;
+        let active = read(device)?;
+        // A rejected request must not replace ownership of the last applied DPI.
+        crate::display_resize::dpi_relative(active.minimum, active.maximum, scale)?;
         // Save expected state before writing, so even failed verification can restore.
         self.applied = Some(scale);
         set(device, scale)
@@ -161,7 +164,7 @@ mod tests {
 
     #[test]
     #[ignore = "changes desktop DPI; disposable Windows runner only"]
-    fn native_dpi_two_hundred_percent_and_restore() {
+    fn native_dpi_change_rejection_and_restore() {
         let _context = crate::windows_preview::DpiContext::enter().unwrap();
         let device = crate::windows_display::primary().unwrap();
         let original = percent(&read(&device).unwrap()).unwrap();
@@ -170,9 +173,26 @@ mod tests {
         let mut resolution = crate::windows_display::DesktopResolution::default();
         // Raise the physical resolution first so 200% is a supported scale.
         resolution.resize(2560, 1440).unwrap();
+        let capability = read(&device).unwrap();
+        let supports_200 =
+            crate::display_resize::dpi_relative(capability.minimum, capability.maximum, 200)
+                .is_ok();
+        let target = if supports_200 {
+            200
+        } else {
+            // Hosted runner display can be limited to 1080p / 175%. Verify a
+            // real non-100% scale there and explicitly report 200% unverified.
+            crate::display_resize::dpi_percent(
+                capability.minimum,
+                capability.maximum,
+                capability.maximum,
+            )
+            .unwrap()
+        };
+        assert!(target > 100, "runner must support a real DPI change");
         {
-            dpi.apply(&device, 200).unwrap();
-            assert_eq!(percent(&read(&device).unwrap()).unwrap(), 200);
+            dpi.apply(&device, target).unwrap();
+            assert_eq!(percent(&read(&device).unwrap()).unwrap(), target);
             let window =
                 minifb::Window::new("MyRemoteApp DPI fixture", 640, 480, Default::default())
                     .unwrap();
@@ -180,14 +200,21 @@ mod tests {
                 unsafe {
                     windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window.get_window_handle())
                 },
-                192,
-                "a new native window must actually receive 192 DPI"
+                target * 96 / 100,
+                "a new native window must receive the actual negotiated DPI"
             );
+            if !supports_200 {
+                assert!(dpi.apply(&device, 200).is_err());
+                assert_eq!(percent(&read(&device).unwrap()).unwrap(), target);
+            }
             dpi.apply(&device, 100).unwrap();
-            dpi.apply(&device, 200).unwrap();
+            dpi.apply(&device, target).unwrap();
         }
         drop(resolution);
         drop(dpi);
         assert_eq!(percent(&read(&device).unwrap()).unwrap(), original);
+        println!(
+            "native_dpi_verified_scale={target}; native_200_percent_verified={supports_200}; restore_verified=true"
+        );
     }
 }

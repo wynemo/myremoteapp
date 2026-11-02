@@ -89,9 +89,15 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo test --locked --release -p remote-cli --target ${{ matrix.target }} windows_display::tests::native_desktop_resize_and_restore -- --ignored --exact --test-threads=1
 
-      - name: Test native Windows 200 percent DPI and restore
+      - name: Test native Windows DPI change, rejection and restore
         if: runner.os == 'Windows'
-        run: cargo test --locked --release -p remote-cli --target ${{ matrix.target }} windows_dpi::tests::native_dpi_two_hundred_percent_and_restore -- --ignored --exact --test-threads=1
+        shell: pwsh
+        run: |
+          $output = cargo test --locked --release -p remote-cli --target ${{ matrix.target }} windows_dpi::tests::native_dpi_change_rejection_and_restore -- --ignored --exact --test-threads=1 --nocapture 2>&1
+          $result = $LASTEXITCODE
+          $output | Write-Output
+          $output | Select-String 'native_dpi_verified_scale=' | ForEach-Object { "$($_.Line)" >> $env:GITHUB_STEP_SUMMARY }
+          exit $result
 
       - name: Build release binary
         run: cargo build --locked --release -p remote-cli --target ${{ matrix.target }}
