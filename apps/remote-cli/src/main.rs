@@ -158,6 +158,9 @@ enum Command {
         /// 只观看画面，不建立键鼠控制连接。
         #[arg(long, conflicts_with_all = ["save_frame", "check_only"])]
         view_only: bool,
+        /// 优化 Retina / 高 DPI 显示：按客户端物理像素调整 Windows 桌面，最高 4K。
+        #[arg(long, conflicts_with_all = ["save_frame", "check_only"])]
+        optimize_retina: bool,
         /// 剪贴板：off / both / send（本端发送）/ receive（本端接收）。只观看时关闭。
         #[arg(long, value_enum, default_value = "both")]
         clipboard: ClipboardMode,
@@ -202,6 +205,7 @@ async fn main() -> Result<()> {
             check_only,
             save_frame,
             view_only,
+            optimize_retina,
             clipboard,
         } => {
             let connection = pairing::ConnectionFile::load(&connection_file)
@@ -275,7 +279,14 @@ async fn main() -> Result<()> {
                 } else {
                     Some(remote_transport::connect_via(&address, config, proxy.as_ref()).await?)
                 };
-                preview::view(stream, control, clipboard_stream, clipboard.permissions()).await?;
+                preview::view(
+                    stream,
+                    control,
+                    clipboard_stream,
+                    clipboard.permissions(),
+                    optimize_retina,
+                )
+                .await?;
             }
         }
         Command::Serve {

@@ -60,7 +60,11 @@ def main():
                         help="exercise native key capture (macOS needs Accessibility)")
     parser.add_argument("--test-resize", action="store_true",
                         help="verify window-size requests to a synthetic Windows host")
+    parser.add_argument("--test-retina", action="store_true",
+                        help="exercise Retina mode with full 4K landscape and portrait frames")
     args = parser.parse_args()
+    if args.test_retina:
+        args.test_resize = True
     binary = args.binary.resolve()
     with tempfile.TemporaryDirectory(prefix="myremoteapp-viewer-") as directory:
         root = pathlib.Path(directory)
@@ -126,7 +130,8 @@ def main():
                             "id": 1, "app": "Windows" if args.test_resize else "MyRemoteApp fixture", "title": "Native viewer test",
                             "width": 960 if args.test_resize else 320, "height": 540 if args.test_resize else 180}})
                         sequence = 0
-                        dimensions = [(960, 540), (540, 960)] if args.test_resize else [(320, 180), (180, 320)]
+                        dimensions = ([(3840, 2160), (2160, 3840)] if args.test_retina else
+                                      [(960, 540), (540, 960)] if args.test_resize else [(320, 180), (180, 320)])
                         for width, height in dimensions:
                             jpeg = gray_jpeg(width, height)
                             for _ in range(25 if args.test_keyboard else 10):
@@ -164,7 +169,7 @@ def main():
         try:
             client = subprocess.Popen(
                 [str(binary), "connect", "--address", address, "--connection-file",
-                 str(root / "host" / "connect.json")],
+                 str(root / "host" / "connect.json")] + (["--optimize-retina"] if args.test_retina else []),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
             try:
                 if sys.platform == "win32" and args.test_keyboard:
@@ -186,7 +191,8 @@ def main():
                 worker.join(timeout=2)
             assert not errors, errors
             assert video_done.is_set(), "synthetic video did not finish"
-            expected_sizes = ["960×540", "540×960"] if args.test_resize else ["320×180", "180×320"]
+            expected_sizes = (["3840×2160", "2160×3840"] if args.test_retina else
+                              ["960×540", "540×960"] if args.test_resize else ["320×180", "180×320"])
             assert all(size in result.stdout for size in expected_sizes), result
             assert result.returncode == 1 and "采集已停止" in result.stderr, result
             kinds = [message["type"] for message in received]

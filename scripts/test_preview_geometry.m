@@ -53,8 +53,13 @@ int main(void) {
         // Outside points must remain outside for Rust to reject letterboxing.
         check_point(view, -1, -1, 800, 600);
         check_point(view, 801, 601, 800, 600);
-        // Convert incoming pixels to AppKit points once and fit the work area.
-        NSRect logical = [window convertRectFromBacking:NSMakeRect(0, 0, 1920, 1080)];
+        // Keep a readable logical window and fit the work area.
+        NSRect logical = NSMakeRect(0, 0, 1920, 1080);
+        size_t pixelWidth = 0, pixelHeight = 0;
+        remote_preview_pixel_size((__bridge void *)view, &pixelWidth, &pixelHeight);
+        NSRect backing = [view convertRectToBacking:view.bounds];
+        assert(pixelWidth == (size_t)llround(backing.size.width));
+        assert(pixelHeight == (size_t)llround(backing.size.height));
         remote_preview_configure_window((__bridge void *)window, 1920, 1080);
         NSRect content = [window contentRectForFrameRect:window.frame];
         assert(content.size.width <= logical.size.width + 1);

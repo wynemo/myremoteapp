@@ -3,13 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, ErrorKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const VERSION: u16 = 7;
+pub const VERSION: u16 = 8;
 pub const MAX_PASSWORD_BYTES: usize = 4096;
 pub const MAX_CONTROL_BYTES: usize = 64 * 1024;
-pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
-pub const MAX_FRAME_WIDTH: u32 = 2560;
-pub const MAX_FRAME_HEIGHT: u32 = 2560;
-pub const MAX_FRAME_PIXELS: usize = 2560 * 1440;
+pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_FRAME_WIDTH: u32 = 3840;
+pub const MAX_FRAME_HEIGHT: u32 = 3840;
+pub const MAX_FRAME_PIXELS: usize = 3840 * 2160;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -431,7 +431,9 @@ mod tests {
     fn frame_dimensions_support_portrait_with_bounded_memory() {
         assert!(validate_frame_size(1440, 2560).is_ok());
         assert!(validate_frame_size(2560, 1440).is_ok());
-        assert!(validate_frame_size(2560, 2560).is_err());
+        assert!(validate_frame_size(3840, 2160).is_ok());
+        assert!(validate_frame_size(2160, 3840).is_ok());
+        assert!(validate_frame_size(3840, 3840).is_err());
         assert!(validate_frame_size(0, 100).is_err());
     }
 

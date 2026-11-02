@@ -170,6 +170,7 @@ mod macos_image {
             height: *mut usize,
         ) -> bool;
         fn remote_preview_keyboard_enabled(view: *mut c_void, enabled: bool);
+        fn remote_preview_pixel_size(view: *mut c_void, width: *mut usize, height: *mut usize);
         fn remote_preview_destroy(view: *mut c_void);
     }
     pub struct Renderer {
@@ -196,6 +197,16 @@ mod macos_image {
             let available =
                 unsafe { remote_preview_mouse(self.view, &mut x, &mut y, &mut width, &mut height) };
             (available.then_some((x, y)), (width, height))
+        }
+        pub fn desktop_size(&self, optimize_retina: bool) -> (usize, usize) {
+            if !optimize_retina {
+                return self.mouse_geometry().1;
+            }
+            let (mut width, mut height) = (0, 0);
+            unsafe {
+                remote_preview_pixel_size(self.view, &mut width, &mut height);
+            }
+            (width, height)
         }
         pub fn present(&mut self, window: &mut minifb::Window, frame: &DecodedFrame) -> Result<()> {
             let key = (frame.sequence, frame.width, frame.height);
@@ -260,6 +271,7 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     control: Option<S>,
     clipboard_stream: Option<ClipboardConnection<S>>,
     clipboard_permissions: remote_session::clipboard::Permissions,
+    optimize_retina: bool,
 ) -> Result<()> {
     use crate::keyboard::{KeyboardQueue, KeyboardTracker};
     use crate::mouse::{ControlClient, MouseSample, MouseTracker, Status};
@@ -378,9 +390,13 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     window.update_with_buffer(&frame.pixels, frame.width, frame.height)?;
                     if let Some(input) = &input {
                         #[cfg(target_os = "macos")]
-                        let size = renderer.mouse_geometry().1;
+                        let size = renderer.desktop_size(optimize_retina);
                         #[cfg(target_os = "windows")]
-                        let size = crate::windows_preview::logical_client_size(&window);
+                        let size = if optimize_retina {
+                            window.get_size()
+                        } else {
+                            crate::windows_preview::logical_client_size(&window)
+                        };
                         if shared.app == "Windows"
                             && let Some((width, height)) =
                                 resize.update(size, std::time::Instant::now())
@@ -462,6 +478,7 @@ pub async fn view<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     _control: Option<S>,
     _clipboard_stream: Option<ClipboardConnection<S>>,
     _clipboard_permissions: remote_session::clipboard::Permissions,
+    _optimize_retina: bool,
 ) -> Result<()> {
     bail!("图形预览支持 macOS 和 Windows；当前平台可用 --save-frame preview.jpg 或 --check-only")
 }

@@ -3,12 +3,13 @@
 #import <QuartzCore/QuartzCore.h>
 #include <stdbool.h>
 
-// Frame dimensions are pixels; AppKit window dimensions are logical points.
+// Start with a readable logical window; Retina mode changes sampling density,
+// not the apparent window size. Constrain the window to AppKit's point work area.
 void remote_preview_configure_window(void *handle, size_t width, size_t height) {
     NSWindow *window = (__bridge NSWindow *)handle;
     NSScreen *screen = window.screen ?: NSScreen.mainScreen;
     NSRect work = screen.visibleFrame;
-    NSRect desired = [window convertRectFromBacking:NSMakeRect(0, 0, width, height)];
+    NSRect desired = NSMakeRect(0, 0, width, height);
     NSRect chrome = [window frameRectForContentRect:NSMakeRect(0, 0, 0, 0)];
     double availableWidth = MAX(1, work.size.width - chrome.size.width);
     double availableHeight = MAX(1, work.size.height - chrome.size.height);
@@ -84,7 +85,7 @@ void *remote_preview_create(void *handle) {
 
 bool remote_preview_present(void *handle, const uint32_t *pixels, size_t width, size_t height) {
     RemotePreviewImageView *view = (__bridge RemotePreviewImageView *)handle;
-    if (!view || !pixels || !width || !height || width > 2560 || height > 2560) return false;
+    if (!view || !pixels || !width || !height || width > 3840 || height > 3840 || width * height > 3840 * 2160) return false;
     CFDataRef data = CFDataCreate(NULL, (const UInt8 *)pixels, width * height * 4);
     if (!data) return false;
     CGDataProviderRef provider = CGDataProviderCreateWithCFData(data);
@@ -128,6 +129,13 @@ bool remote_preview_mouse(void *handle, float *x, float *y, size_t *width, size_
     if (!view || !view.window) return false;
     return preview_input_geometry(view, view.window.mouseLocationOutsideOfEventStream,
                                   x, y, width, height);
+}
+
+void remote_preview_pixel_size(void *handle, size_t *width, size_t *height) {
+    RemotePreviewImageView *view = (__bridge RemotePreviewImageView *)handle;
+    NSRect pixels = [view convertRectToBacking:view.bounds];
+    *width = (size_t)MAX(0, llround(pixels.size.width));
+    *height = (size_t)MAX(0, llround(pixels.size.height));
 }
 
 static void preview_key_transition(NSWindow *window, NSEvent *source, unsigned short key, BOOL down) {

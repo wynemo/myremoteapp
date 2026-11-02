@@ -61,8 +61,9 @@ pub fn configure(window: &minifb::Window, pixels: (usize, usize)) -> Result<()> 
     );
     let border = (chrome.right - chrome.left, chrome.bottom - chrome.top);
     let work = monitor.rcWork;
+    let physical = (pixels.0 * dpi as usize / 96, pixels.1 * dpi as usize / 96);
     let size = crate::display_resize::fit_size(
-        pixels,
+        physical,
         (
             (work.right - work.left - border.0).max(1) as usize,
             (work.bottom - work.top - border.1).max(1) as usize,
