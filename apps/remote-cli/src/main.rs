@@ -371,7 +371,7 @@ async fn main() -> Result<()> {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             let clipboard_host = if !view_only && !check_only && clipboard.permissions().enabled() {
                 Some(remote_session::clipboard::Host::new(
-                    Arc::new(crate::clipboard::Native),
+                    Arc::new(crate::clipboard::Native::default()),
                     clipboard.permissions(),
                 ))
             } else {

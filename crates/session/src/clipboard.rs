@@ -16,6 +16,9 @@ use tokio::{
 pub const MAX_TEXT: usize = 1024 * 1024;
 pub const MAX_IMAGE: usize = 32 * 1024 * 1024;
 pub const MAX_PIXELS: usize = 16 * 1024 * 1024;
+pub const MAX_FILES: usize = 64 * 1024 * 1024;
+// File preparation and transfer can take longer than a control heartbeat.
+pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 pub struct Content {
@@ -34,6 +37,10 @@ impl Content {
             ClipboardFormat::Png => ensure!(
                 self.bytes.len() <= MAX_IMAGE,
                 "clipboard image exceeds limit"
+            ),
+            ClipboardFormat::Files => ensure!(
+                self.bytes.len() <= MAX_FILES,
+                "clipboard files exceed limit"
             ),
         }
         Ok(())
@@ -153,7 +160,7 @@ async fn read_packet<R: AsyncRead + Unpin>(
     reader: &mut R,
     offer: &mut Option<(u64, ClipboardFormat, usize)>,
 ) -> Result<Packet> {
-    let message = timeout(IO_TIMEOUT, read_message(reader)).await??;
+    let message = timeout(TRANSFER_TIMEOUT, read_message(reader)).await??;
     let mut content = None;
     match &message {
         Message::ClipboardOffer {
@@ -165,6 +172,7 @@ async fn read_packet<R: AsyncRead + Unpin>(
             let limit = match format {
                 ClipboardFormat::Text => MAX_TEXT,
                 ClipboardFormat::Png => MAX_IMAGE,
+                ClipboardFormat::Files => MAX_FILES,
             };
             ensure!(
                 *length > 0 && *length as usize <= limit,
@@ -178,7 +186,7 @@ async fn read_packet<R: AsyncRead + Unpin>(
                 .ok_or_else(|| anyhow::anyhow!("unsolicited clipboard data"))?;
             ensure!(*revision == expected, "clipboard revision mismatch");
             let mut bytes = vec![0; length];
-            timeout(IO_TIMEOUT, reader.read_exact(&mut bytes)).await??;
+            timeout(TRANSFER_TIMEOUT, reader.read_exact(&mut bytes)).await??;
             let value = Content {
                 format,
                 bytes: Arc::new(bytes),
@@ -195,7 +203,7 @@ async fn send<W: AsyncWrite + Unpin>(
     message: &Message,
     content: Option<&Content>,
 ) -> Result<()> {
-    timeout(IO_TIMEOUT, async {
+    timeout(TRANSFER_TIMEOUT, async {
         write_message(writer, message).await?;
         if let Some(content) = content {
             // Keep writes bounded rather than passing a huge slice downstream.
@@ -420,7 +428,12 @@ pub async fn exchange_with_progress<S: AsyncRead + AsyncWrite + Unpin + Send>(
                         }
                         Message::ClipboardApplied {revision:id,generation:applied} => {
                             if !server { generation=generation.max(applied); }
-                            if pending.as_ref().is_some_and(|(sent,_)| *sent==id) { settle(pending_version); pending=None; }
+                            if pending.as_ref().is_some_and(|(sent,_)| *sent==id) {
+                                if pending.as_ref().is_some_and(|(_,content)| content.format==ClipboardFormat::Files) {
+                                    eprintln!("剪贴板文件已同步到另一端，可粘贴");
+                                }
+                                settle(pending_version); pending=None;
+                            }
                             else if !server && let Some((id,content))=&pending {
                                 advertise(&mut writer,*id,generation,content).await?;
                             }
@@ -614,6 +627,12 @@ mod tests {
                 format: ClipboardFormat::Text,
                 length: MAX_TEXT as u32 + 1,
             },
+            Message::ClipboardOffer {
+                revision: 1,
+                generation: 0,
+                format: ClipboardFormat::Files,
+                length: MAX_FILES as u32 + 1,
+            },
             Message::ClipboardData { revision: 1 },
         ] {
             let (mut client, mut server) = tokio::io::duplex(1024);
@@ -622,7 +641,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn bidirectional_text_large_image_no_initial_overwrite_or_echo_loop() {
+    async fn bidirectional_text_image_files_no_initial_overwrite_or_echo_loop() {
         let a = Memory::new("host existing");
         let b = Memory::new("client existing");
         let (server, client) = pair(a.clone(), b.clone());
@@ -637,6 +656,12 @@ mod tests {
         };
         a.copy(image.clone());
         until(|| b.bytes() == *image.bytes).await;
+        let files = Content {
+            format: ClipboardFormat::Files,
+            bytes: Arc::new(vec![43; 300_000]),
+        };
+        b.copy(files.clone());
+        until(|| a.bytes() == *files.bytes && b.bytes() == *files.bytes).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
         let versions = (a.version(), b.version());
         tokio::time::sleep(Duration::from_millis(300)).await;

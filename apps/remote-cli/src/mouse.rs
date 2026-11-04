@@ -352,7 +352,7 @@ mod connection {
                         if paste_modifier && matches!(&message, Message::Key {event:remote_protocol::KeyEvent {key:KeyCode::V,down:true,..}}) {
                             let current=barrier.lock().unwrap().clone();
                             if let Some((backend,progress))=current {
-                                let ready=timeout(remote_session::IO_TIMEOUT,async {
+                                let ready=timeout(remote_session::clipboard::TRANSFER_TIMEOUT,async {
                                     loop {
                                         if progress.healthy.load(std::sync::atomic::Ordering::Acquire) && backend.available() && backend.version()==progress.settled_version.load(std::sync::atomic::Ordering::Acquire) {break Ok::<_,anyhow::Error>(());}
                                         tokio::select! {

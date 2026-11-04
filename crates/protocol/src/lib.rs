@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, ErrorKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const VERSION: u16 = 9;
+pub const VERSION: u16 = 10;
 pub const MAX_PASSWORD_BYTES: usize = 4096;
 pub const MAX_CONTROL_BYTES: usize = 64 * 1024;
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
@@ -310,6 +310,7 @@ pub enum Message {
 pub enum ClipboardFormat {
     Text,
     Png,
+    Files,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]

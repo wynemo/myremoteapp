@@ -4,7 +4,18 @@ use remote_protocol::ClipboardFormat;
 use remote_session::clipboard::{Backend, Content, MAX_IMAGE, MAX_PIXELS, MAX_TEXT};
 use std::{borrow::Cow, io::Cursor, sync::Arc};
 
-pub struct Native;
+mod files;
+
+#[derive(Default)]
+pub struct Native {
+    // Retain previous bundles too: an application may still be copying them.
+    received: std::sync::Mutex<ReceivedFiles>,
+}
+#[derive(Default)]
+struct ReceivedFiles {
+    bundles: Vec<files::Staged>,
+    bytes: usize,
+}
 impl Backend for Native {
     fn available(&self) -> bool {
         #[cfg(target_os = "macos")]
@@ -35,10 +46,23 @@ impl Backend for Native {
             return Ok(None);
         }
         let mut clipboard = Clipboard::new()?;
-        // A copied file may also expose an image preview or a text path. File
-        // transfer is deliberately excluded rather than pasting that preview.
-        if clipboard.get().file_list().is_ok() {
-            return Ok(None);
+        if let Ok(paths) = clipboard.get().file_list() {
+            return match files::pack(&paths) {
+                Ok(bytes) => {
+                    eprintln!(
+                        "已读取剪贴板文件（{:.1} MiB），等待同步",
+                        bytes.len() as f64 / (1024.0 * 1024.0)
+                    );
+                    Ok(Some(Content {
+                        format: ClipboardFormat::Files,
+                        bytes: Arc::new(bytes),
+                    }))
+                }
+                Err(error) => {
+                    eprintln!("剪贴板文件未发送：{error:#}");
+                    Ok(None)
+                }
+            };
         }
         if let Ok(image) = clipboard.get_image() {
             if image
@@ -79,6 +103,24 @@ impl Backend for Native {
         allowed: &(dyn Fn() -> bool + Sync),
     ) -> Result<Option<u64>> {
         content.validate()?;
+        if content.format == ClipboardFormat::Files {
+            let mut received = self.received.lock().unwrap();
+            ensure!(
+                received.bundles.len() < 32
+                    && received.bytes + content.bytes.len() <= 256 * 1024 * 1024,
+                "剪贴板文件暂存已满，请完成粘贴后重启本端程序"
+            );
+            let staged = files::unpack(&content.bytes)?;
+            let mut clipboard = Clipboard::new()?;
+            if !allowed() || !self.available() || self.version() != expected {
+                return Ok(None);
+            }
+            clipboard.set().file_list(&staged.roots)?;
+            received.bytes += content.bytes.len();
+            received.bundles.push(staged);
+            eprintln!("剪贴板文件已接收，可粘贴到 Finder / 资源管理器");
+            return Ok(Some(self.version()));
+        }
         // Decode before the final version check, as a large image can take time.
         let image = if content.format == ClipboardFormat::Png {
             Some(decode(&content.bytes)?)
@@ -172,24 +214,26 @@ fn decode(bytes: &[u8]) -> Result<ImageData<'static>> {
 
 struct ActiveBackend {
     active: Arc<std::sync::atomic::AtomicBool>,
+    native: Native,
 }
 impl Backend for ActiveBackend {
     fn available(&self) -> bool {
-        self.active.load(std::sync::atomic::Ordering::Acquire) && Native.available()
+        self.active.load(std::sync::atomic::Ordering::Acquire) && self.native.available()
     }
     fn version(&self) -> u64 {
-        Native.version()
+        self.native.version()
     }
     fn read(&self) -> Result<Option<Content>> {
         if self.available() {
-            Native.read()
+            self.native.read()
         } else {
             Ok(None)
         }
     }
     fn write(&self, expected: u64, content: &Content) -> Result<Option<u64>> {
         if self.available() {
-            Native.write_guarded(expected, content, &|| self.available())
+            self.native
+                .write_guarded(expected, content, &|| self.available())
         } else {
             Ok(None)
         }
@@ -209,6 +253,7 @@ impl Running {
         let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let backend: Arc<dyn Backend> = Arc::new(ActiveBackend {
             active: active.clone(),
+            native: Native::default(),
         });
         let progress = Arc::new(remote_session::clipboard::Progress::default());
         let native = backend.clone();
@@ -272,12 +317,22 @@ mod tests {
             std::env::var_os("REMOTEAPP_CLIPBOARD_NATIVE_TEST").is_some(),
             "native clipboard test is restricted to disposable runners"
         );
-        let backend = Native;
+        let backend = Native::default();
         assert!(backend.available());
+        let source = tempfile::tempdir().unwrap();
+        let folder = source.path().join("中文🙂");
+        std::fs::create_dir_all(folder.join("empty")).unwrap();
+        std::fs::write(folder.join("binary.dat"), [0, 255, 13, 10]).unwrap();
+        let file = source.path().join("zero.txt");
+        std::fs::write(&file, []).unwrap();
         for content in [
             Content {
                 format: ClipboardFormat::Text,
                 bytes: Arc::new("中文🙂\nclipboard".as_bytes().to_vec()),
+            },
+            Content {
+                format: ClipboardFormat::Files,
+                bytes: Arc::new(files::pack(&[folder, file]).unwrap()),
             },
             Content {
                 format: ClipboardFormat::Png,
@@ -302,13 +357,22 @@ mod tests {
             assert!(backend.write(version, &content).unwrap().is_some());
             let read = backend.read().unwrap().unwrap();
             assert_eq!(read.format, content.format);
-            if read.format == ClipboardFormat::Text {
-                assert_eq!(read.bytes, content.bytes);
-            } else {
-                assert_eq!(
+            match read.format {
+                ClipboardFormat::Text => assert_eq!(read.bytes, content.bytes),
+                ClipboardFormat::Png => assert_eq!(
                     decode(&read.bytes).unwrap().bytes,
                     decode(&content.bytes).unwrap().bytes
-                );
+                ),
+                ClipboardFormat::Files => {
+                    let staged = files::unpack(&read.bytes).unwrap();
+                    assert_eq!(staged.roots.len(), 2);
+                    assert!(staged.roots[0].join("empty").is_dir());
+                    assert_eq!(
+                        std::fs::read(staged.roots[0].join("binary.dat")).unwrap(),
+                        [0, 255, 13, 10]
+                    );
+                    assert_eq!(std::fs::metadata(&staged.roots[1]).unwrap().len(), 0);
+                }
             }
             assert!(
                 backend
